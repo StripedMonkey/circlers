@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use bincode::{Decode, Encode};
 use clap::Parser as _;
 use mpi::{
     topology::SimpleCommunicator,
@@ -18,8 +19,7 @@ use nix::{
     sys::stat::Mode,
 };
 use rand::Rng;
-use serde::{Deserialize, Serialize};
-use tracing::{debug, error, trace};
+use tracing::{error, trace};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt};
 
 #[derive(clap::Parser)]
@@ -28,12 +28,12 @@ struct Args {
     root: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 struct WorkMessage<T> {
     paths: Vec<T>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 #[repr(i32)]
 enum WorkRequest {
     RequestWork = 1,
@@ -43,23 +43,31 @@ enum WorkRequest {
 struct Worker<T> {
     comm: SimpleCommunicator,
     queue: VecDeque<T>,
+    /// Function called when visiting a directory entry.
+    ///
+    /// This function is also the thing responsible for enqueueing new work based on whatever
+    /// heuristics the user needs. This also allows the user to define the type of the path, so
+    /// long as it implements [`NixPath`](nix::NixPath) and is encodable/decodable with bincode.
     visit_element: fn(&mut Self, &T, Entry),
+    /// Function called when an error is encountered trying to visit a directory/file path.
+    ///
+    /// This can happen in two situations:
+    /// 1. When trying to open a directory to read its entries, mainly due to permission errors.
+    /// 2. When reading entries from a directory that have become invalid since the directory was
+    ///    opened.
     visit_error: fn(&mut Self, &T, nix::Error),
+    /// The number of work receipts that are currently pending. When offering work, we use this to
+    /// track how many offers have not been accepted yet for termination detection.
+    pending_work_receipts: usize,
 }
 
-impl<T> Worker<T>
-where
-    T: Serialize + for<'a> Deserialize<'a> + Debug + NixPath,
-{
-    fn enqueue(&mut self, element: T) {
+impl<T> Worker<T> {
+    /// Enqueue a new element to be processed by the worker.
+    pub fn enqueue(&mut self, element: T) {
         self.queue.push_back(element);
     }
 
-    fn split_fraction_work(&mut self, fraction: f32) -> VecDeque<T> {
-        let num_elements = (self.queue.len() as f32 * fraction).ceil() as usize;
-        self.split_work(num_elements)
-    }
-
+    /// Split off a number of elements from the current work queue
     fn split_work(&mut self, num_elements: usize) -> VecDeque<T> {
         // TODO: We do this for two assumptions:
         // 1. The first elements in the queue are going to be higher up in the directory tree
@@ -71,7 +79,12 @@ where
         mem::swap(&mut split, &mut self.queue);
         split
     }
+}
 
+impl<T> Worker<T>
+where
+    T: Encode + Decode<()> + Debug + NixPath,
+{
     fn process_entry(&mut self, path: &T) {
         // TODO: Investigate the performance impact of using O_DIRECT here
         let mut dir = match Dir::open(path, OFlag::O_DIRECTORY | OFlag::O_RDONLY, Mode::empty()) {
@@ -135,8 +148,8 @@ where
                 send_data.len(),
                 requester
             );
-            let serialized =
-                bincode::serialize(&send_data).expect("Failed to serialize work message");
+            let serialized = bincode::encode_to_vec(&send_data, bincode::config::standard())
+                .expect("Failed to serialize work message");
             self.comm
                 .process_at_rank(requester)
                 .send_with_tag(&serialized, WorkRequest::WorkOffer as i32);
@@ -162,14 +175,22 @@ where
         let other_process = self.comm.process_at_rank(target_rank);
         other_process.send_with_tag::<[u8]>([0].as_slice(), WorkRequest::RequestWork as i32);
         trace!("Waiting for work offer from {}", target_rank);
-        let (buf,_status) = other_process.receive_vec_with_tag(WorkRequest::WorkOffer as i32);
-        trace!("Received work offer from {} ({} bytes)", target_rank, buf.len());
-        let message: Vec<T> = bincode::deserialize(&buf).unwrap();
+        let (buf, _status) = other_process.receive_vec_with_tag(WorkRequest::WorkOffer as i32);
+        trace!(
+            "Received work offer from {} ({} bytes)",
+            target_rank,
+            buf.len()
+        );
+        let (message, _count): (Vec<T>, usize) =
+            bincode::decode_from_slice(&buf, bincode::config::standard()).unwrap();
         self.queue.extend(message);
     }
 
+    /// Begin processing work items in the queue
     pub fn work(&mut self) {
-        loop {// TODO: Async with `select!` would be super nice. Implementing async 
+        loop {
+            // NOTE: The current implementation has to be non-blocking
+            // TODO: Async with `select!` would be super nice. Implementing async
 
             self.process_work_requests();
 
@@ -230,6 +251,7 @@ impl Worker<PathBuf> {
             queue,
             visit_element: visit_element_f,
             visit_error: visit_error_f,
+            pending_work_receipts: todo!(),
         }
     }
     fn unseeded_worker(mpi: SimpleCommunicator) -> Self {
@@ -242,6 +264,7 @@ impl Worker<PathBuf> {
             queue,
             visit_element: visit_element_f,
             visit_error: visit_error_f,
+            pending_work_receipts: todo!(),
         }
     }
 }
