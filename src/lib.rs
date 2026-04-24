@@ -1,247 +1,329 @@
+pub mod async_mpi;
+pub mod termination_detector;
+pub mod walker;
 
 use std::{
-    ffi::{CStr, CString},
-    os::fd::{AsFd, AsRawFd, BorrowedFd},
+    ffi::CString,
+    os::unix::ffi::OsStringExt,
+    path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use ferrompi::Communicator;
 use futures::{FutureExt as _, select};
-use nix::{
-    NixPath as _,
-    dir::{Dir, Entry},
-    fcntl::{AtFlags, OFlag},
-    sys::stat::{Mode, fstatat},
-};
-use smol::{lock::Mutex, pin};
+use rand::{Rng as _, seq::SliceRandom as _};
+use serde::{Deserialize, Serialize};
+use smol::pin;
+use tracing::{debug, trace};
 
-type OnEntryCallback = fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>;
+use crate::{termination_detector::TerminationDetectionState, walker::OnEntryCallback};
 
 pub struct Circle {
     comm: Communicator,
-    on_file_entry: Option<OnEntryCallback>,
-    on_directory_entry: Option<OnEntryCallback>,
-    work_queue: Mutex<Vec<CString>>,
+    locally_idle: AtomicBool,
+    termination_state: TerminationDetectionState,
+    on_file_entry: OnEntryCallback,
+    on_dir_entry: OnEntryCallback,
 }
 
-fn on_directory(fd: &dyn AsFd, dir_path: &CStr, entry: &Entry) -> nix::Result<()> {
-    println!("Directory: {:?} in {:?}", entry.file_name(), dir_path);
-    Ok(())
+/// Tag for sending and receiving messages between ranks.
+#[derive(Debug, Clone, Copy)]
+#[repr(i32)]
+pub(crate) enum Tag {
+    WorkRequest = 10,
+    WorkResponse,
+    WorkAck,
+    TerminationToken,
+    TerminationConfirmed,
 }
 
-fn on_file(fd: &dyn AsFd, dir_path: &CStr, entry: &Entry) -> nix::Result<()> {
-    let stat = match fstatat(fd, entry.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-        Ok(stat) => stat,
-        Err(e) => return Err(e),
-    };
-    let mode = stat.st_mode;
-    println!(
-        "File: {:?} (mode {:o} in {:?}",
-        entry.file_name(),
-        mode,
-        dir_path
-    );
-    Ok(())
+impl From<i32> for Tag {
+    fn from(value: i32) -> Self {
+        match value {
+            10 => Tag::WorkRequest,
+            11 => Tag::WorkResponse,
+            12 => Tag::WorkAck,
+            13 => Tag::TerminationToken,
+            14 => Tag::TerminationConfirmed,
+            _ => panic!("Invalid tag value: {value}"),
+        }
+    }
 }
+
+pub const SOURCE_ANY: i32 = -1;
+
+#[derive(Debug, Serialize, Deserialize)]
+enum WorkResponse {
+    Work(Vec<Vec<u8>>),
+    Reject,
+}
+
+#[derive(Debug)]
+pub enum CircleError {
+    Mpi(ferrompi::Error),
+    Serialization(Box<bincode::ErrorKind>),
+    InvalidMessageCount(i64),
+    NoPeerRanks,
+}
+
+impl std::fmt::Display for CircleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CircleError::Mpi(err) => write!(f, "MPI error: {err}"),
+            CircleError::Serialization(err) => write!(f, "Serialization error: {err}"),
+            CircleError::InvalidMessageCount(count) => {
+                write!(f, "Invalid message count from MPI status: {count}")
+            }
+            CircleError::NoPeerRanks => write!(f, "Cannot request work without peer ranks"),
+        }
+    }
+}
+
+impl std::error::Error for CircleError {}
+
+impl From<ferrompi::Error> for CircleError {
+    fn from(value: ferrompi::Error) -> Self {
+        Self::Mpi(value)
+    }
+}
+
+impl From<Box<bincode::ErrorKind>> for CircleError {
+    fn from(value: Box<bincode::ErrorKind>) -> Self {
+        Self::Serialization(value)
+    }
+}
+
+// The main loop of the walk consists of the following tasks, running asynchronously:
+// 1. Walking the directory tree, processing entries as they are encountered, a directory at a time. The walk
+//    is directory-wide, depth first, and distributed across the ranks. To perform the minimum number of
+//    syscalls possible, we iterate over the directory entries, stashing the directories for later processing.
+//    after processing the entries in the current directory, we stash all but one of the directories in a queue
+//    for later processing or distribution to other ranks, and then we process the remaining directory. If there
+//    are no directories, we pop a directory from the queue and work on that one.
+//    For each entry, we call a user-provided callback as appropriate
+//
+// 2. "Making progress" on termination detection. The program is considered terminated when
+//    a. All processes are "locally terminated"
+//    b. There are no messages in transit
+//
+// 3. Responding to messages from other ranks, which consists of
+//    a. Requesting work (directories to process) from other ranks, if we are idle and have no work in our queue
+//    b. Responding to work requests from other ranks, if we have work in our queue, we split off a portion of
+//       our queue and send it to the requesting rank. The exact portion of the queue to send is something I
+//       would like to experiment with. According to
+//       [When Random is Better: Parallel File Tree Walking](http://jlafon.io/parallel-file-treewalk-part-II.html)
+//       randomized queue splitting performs better than splitting in half every time. This makes some sense,
+//       but surely there are even better strategies. It seems like the author tried the random queue splitting
+//       and that was fast enough that the syscall overhead dominated, so they didn't continue further.
 
 impl Circle {
     pub fn new(world: &Communicator) -> Result<Self, ferrompi::Error> {
+        let comm = world.duplicate()?;
+        let term_detector = TerminationDetectionState::new(&comm);
         Ok(Circle {
-            comm: world.duplicate()?,
-            on_file_entry: Some(on_file),
-            on_directory_entry: Some(on_directory),
-            work_queue: Mutex::new(Vec::new()),
+            comm,
+            locally_idle: AtomicBool::new(false),
+            termination_state: term_detector,
+            on_file_entry: |_, _, _| Ok(()),
+            on_dir_entry: |_, _, _| Ok(()),
         })
     }
 
-    pub async fn make_progress(&mut self) {
-        // The main loop of the walk consists of the following tasks, running asynchronously:
-        // 1. Walking the directory tree, processing entries as they are encountered, a directory at a time. The walk
-        //    is directory-wide, depth first, and distributed across the ranks. To perform the minimum number of
-        //    syscalls possible, we iterate over the directory entries, stashing the directories for later processing.
-        //    after processing the entries in the current directory, we stash all but one of the directories in a queue
-        //    for later processing or distribution to other ranks, and then we process the remaining directory. If there
-        //    are no directories, we pop a directory from the queue and work on that one.
-        //    For each entry, we call a user-provided callback as appropriate
-        //
-        // 2. "Making progress" on termination detection. The program is considered terminated when
-        //    a. All processes are "locally terminated"
-        //    b. There are no messages in transit
-        //
-        // 3. Responding to messages from other ranks, which consists of
-        //    a. Requesting work (directories to process) from other ranks, if we are idle and have no work in our queue
-        //    b. Responding to work requests from other ranks, if we have work in our queue, we split off a portion of
-        //       our queue and send it to the requesting rank. The exact portion of the queue to send is something I
-        //       would like to experiment with. According to
-        //       [When Random is Better: Parallel File Tree Walking](http://jlafon.io/parallel-file-treewalk-part-II.html)
-        //       randomized queue splitting performs better than splitting in half every time. This makes some sense,
-        //       but surely there are even better strategies. It seems like the author tried the random queue splitting
-        //       and that was fast enough that the syscall overhead dominated, so they didn't continue further.
-        let work_dir_queue = self.work_directory_queue().fuse();
-        pin!(work_dir_queue);
-        select! {
-            res = work_dir_queue => {
-                if let Err(e) = res {
-                    eprintln!("Error walking directory queue: {:?}", e);
-                }
+    pub fn set_on_file_entry(&mut self, callback: OnEntryCallback) {
+        self.on_file_entry = callback;
+    }
 
-            }
+    pub fn set_on_dir_entry(&mut self, callback: OnEntryCallback) {
+        self.on_dir_entry = callback;
+    }
+
+    pub async fn start_walk(&mut self, path: Option<&Path>) {
+        let mut walker = walker::Walker::new();
+
+        walker.set_on_file_entry(self.on_file_entry);
+        walker.set_on_directory_entry(self.on_dir_entry);
+
+        if let Some(path) = path {
+            walker.push_new([path]).await.unwrap();
         }
-    }
 
-    pub async fn walk_files_with_seed(&mut self, seed: &str) -> std::io::Result<()> {
-        self.work_queue
-            .lock()
-            .await
-            .push(CString::new(seed).expect("Seed path contained null byte!"));
-        self.make_progress().await;
-        Ok(())
-    }
-
-    /// Work on the current directory queue until it's empty, processing all available directories,
-    /// calling `self.on_directory_entry` and `self.on_file_entry` as appropriate.
-    async fn work_directory_queue(&self) -> nix::Result<()> {
+        // At this point, we have two tasks we need to run concurrently:
+        // - The directory walk
+        // - Work request handling
+        // We don't need to handle termination detection since we know termination can't occur until we're locally idle.
+        // any termination progress can be made after we're idle.
+        let handle_work_requests = self.work_loop(walker.get_queue()).fuse();
+        pin!(handle_work_requests);
         loop {
-            // Pop a directory from the queue, or break if there's no work to do.
-            let Some(dir_path) = self.work_queue.lock().await.pop() else {
-                break;
-            };
-            match self.walk_directory_path(&dir_path) {
-                Ok(None) => continue,
-                Err(e) => eprintln!("Error walking directory {:?}: {:?}", dir_path, e),
-                Ok(Some((dir_iterator, entry, new_dir_path))) => {
-                    // We have some subdirectory we can work on, so we repeatedly process it until we run out of
-                    // subdirectories.
+            let walker_task = walker.work_directory_queue().fuse();
+            pin!(walker_task);
+            select! {
+                res = walker_task => {
+                    if let Err(e) = res {
+                        panic!("Error walking directory queue: {:?}", e);
+                    }
+                },
+                e = handle_work_requests => {
+                    panic!("Work request handling should never complete: {:?}", e);
+                },
+            }
+            debug_assert!(
+                walker.queue_len() == 0,
+                "
+                After completing a walk task, the queue should be empty since we should have stashed all directories for
+                later processing or distribution.
+                "
+            );
+            // We've completed all the work we have available to us, and we have to wait for more work to arrive or for
+            // termination to be detected.
+            // TODO: We're considered idle right now. This would be the point to notify the termination detection if we
+            // need to.
+            // We need to now start making progress on termination detection
+            trace!("Locally idle, polling for more work or termination");
+            let handle_termination_detection = self.detect_termination().fuse();
+            pin!(handle_termination_detection);
+            select! {
+                // Even though we have no work to give out, we still need to reject work requests from other ranks to
+                // prevent deadlocks/cyclic work requests.
+                e = handle_work_requests => {
+                    panic!("Work request handling task should never complete: {:?}", e);
+                },
+                // If we receive work, we're no longer idle, and we can go back to work by looping.
+                work = self.request_work().fuse() => match work {
+                    Ok(work) => {
+                        self.locally_idle.store(false, std::sync::atomic::Ordering::SeqCst);
+                        debug!("Received {} work items from another rank", work.len());
+                        walker.push_new(work).await.unwrap();
+                        continue;
+                    },
+                    Err(e) => {
+                        panic!("Error requesting work from other ranks: {}", e);
+                    }
+                },
+                // We made enough progress on termination that it's been detected, exit gracefully.
+                t = handle_termination_detection => {
+                    if let Err(e) = t {
+                        panic!("Error on detecting termination: {:?}", e);
+                    }
+                    // Termination was detected, and we're currently idle, so we can terminate gracefully.
+                    debug!("Termination detected, exiting");
+                    break;
+                },
+            }
+        }
+    }
 
-                    // We stash the dir iterator behind a `dyn AsRawFd` to keep it around, even when we use a borrowed
-                    // file descriptor to prevent use-after-free issues.
-                    let mut dir_iterator: Box<dyn AsRawFd> = Box::new(dir_iterator);
-                    let mut current_entry = entry;
-                    let mut current_dir_path = new_dir_path;
-                    loop {
-                        // SAFETY: We can never use `dir_fd` without after we drop `dir_iterator`
-                        let dir_fd = unsafe { BorrowedFd::borrow_raw(dir_iterator.as_raw_fd()) };
-                        match self.walk_directory_fd(dir_fd, &current_entry, &current_dir_path) {
-                            Ok(None) => break,
-                            Err(e) => {
-                                eprintln!(
-                                    "Error walking directory {:?}: {:?}",
-                                    current_dir_path, e
-                                );
-                                break;
+    async fn request_work(&self) -> Result<Vec<PathBuf>, CircleError> {
+        let rank = self.comm.rank();
+        let size = self.comm.size();
+
+        if size <= 1 {
+            return Err(CircleError::NoPeerRanks);
+        }
+
+        loop {
+            // Choose a random priority order to request work from.
+            let mut candidates: Vec<i32> =
+                (0..size).filter(|&candidate| candidate != rank).collect();
+            let mut rng = rand::rng();
+            candidates.shuffle(&mut rng);
+
+            for candidate in candidates {
+                let request_payload = [0u8];
+                async_mpi::isend(
+                    &self.comm,
+                    &request_payload,
+                    candidate,
+                    Tag::WorkRequest as i32,
+                )
+                .await?;
+
+                let response_buf =
+                    async_mpi::receive_tagged(&self.comm, candidate, Tag::WorkResponse as i32)
+                        .await?;
+
+                let response: WorkResponse = bincode::deserialize(&response_buf)?;
+                if let WorkResponse::Work(paths) = response {
+                    let work = paths
+                        .into_iter()
+                        .map(|path| PathBuf::from(std::ffi::OsString::from_vec(path)))
+                        .collect();
+
+                    // Ack that we received work from `candidate`.
+                    let ack_payload = [0u8];
+                    async_mpi::isend(&self.comm, &ack_payload, candidate, Tag::WorkAck as i32)
+                        .await?;
+
+                    return Ok(work);
+                }
+            }
+            debug!("Looping through all candidates for work didn't yield any work, retrying...");
+        }
+    }
+
+    /// Handle incoming work requests, acks, and tokens
+    async fn work_loop(
+        &self,
+        queue: Arc<smol::lock::Mutex<Vec<CString>>>,
+    ) -> Result<(), CircleError> {
+        // Continuously handle four types of incoming messages:
+        // 1. WorkRequest: respond with work from our queue or reject
+        // 2. WorkAck: receive acknowledgment that our work was received
+        // 3. Token: receive the token for distributed termination detection
+        // 4. TerminationConfirmed: receive confirmation that termination has been detected and we can exit
+        loop {
+            // Check for WorkRequest
+            let probe_work_request =
+                async_mpi::probe_tag(&self.comm, SOURCE_ANY, Tag::WorkRequest as i32).fuse();
+            let probe_work_ack =
+                async_mpi::probe_tag(&self.comm, SOURCE_ANY, Tag::WorkAck as i32).fuse();
+            pin!(probe_work_request);
+            pin!(probe_work_ack);
+            select! {
+                work_request_status = probe_work_request => {
+                    let work_request_status = work_request_status?;
+                    trace!("Received WorkRequest from rank {}", work_request_status.source);
+                    let mut request_buf = vec![0u8; work_request_status.count as usize];
+                    async_mpi::irecv(&self.comm, &mut request_buf, work_request_status.source, Tag::WorkRequest as i32).await?;
+                    let response = {
+                        let mut queue_guard = queue.lock().await;
+                        if queue_guard.is_empty() {
+                            trace!("Rejecting WorkRequest from rank {} since we have no work to share", work_request_status.source);
+                            WorkResponse::Reject
+                        } else {
+                            // If we're sending work, mark ourselves as black and increment pending receipts
+                            self.termination_state.on_message_sent().await;
+                            let mut rng = rand::rng();
+                            // Keep at least one item in the queue for ourselves, and share the rest.
+                            let share_count = rng.random_range(1..=queue_guard.len());
+                            let mut shared_work = Vec::with_capacity(share_count);
+                            for _ in 0..share_count {
+                                let idx = rng.random_range(0..queue_guard.len());
+                                shared_work.push(queue_guard.swap_remove(idx).into_bytes());
                             }
-                            Ok(Some((new_dir_iterator, entry, new_dir_path))) => {
-                                dir_iterator = Box::new(new_dir_iterator);
-                                current_entry = entry;
-                                current_dir_path = new_dir_path;
-                            }
+                            trace!("Sharing {} work items with rank {}", shared_work.len(), work_request_status.source);
+                            WorkResponse::Work(shared_work)
                         }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn walk_directory_path(
-        &self,
-        dir_path: &CStr,
-    ) -> nix::Result<Option<(impl AsRawFd, CString, CString)>> {
-        let dir = nix::dir::Dir::open(
-            dir_path,
-            OFlag::O_DIRECTORY | OFlag::O_RDONLY,
-            Mode::empty(),
-        )?;
-        self.on_directory(dir, dir_path)
-    }
-
-    // TODO: `walk_directory_fd` puts a lifetime on `AsRawFd` tying it to the lifetime of `self`  via
-    // `impl AsRawFd + '_`, but this isn't really necessary, as `openat` shouldn't hold onto the fd we open it with.
-    // Figure out how to remove or separate the lifetimes here.
-    fn walk_directory_fd(
-        &self,
-        parent_fd: impl AsFd,
-        dir_name: &CStr,
-        dir_path: &CStr,
-    ) -> nix::Result<Option<(impl AsRawFd + '_, CString, CString)>> {
-        let dir = nix::dir::Dir::openat(
-            parent_fd,
-            dir_name,
-            OFlag::O_DIRECTORY | OFlag::O_RDONLY,
-            Mode::empty(),
-        )?;
-        self.on_directory(dir, dir_path)
-    }
-
-    fn on_directory(
-        &self,
-        dir: Dir,
-        dir_path: &CStr,
-    ) -> nix::Result<Option<(impl AsRawFd + '_, CString, CString)>> {
-        let mut dir_iterator = dir.into_iter();
-        let mut dir_names = Vec::new();
-
-        while let Some(entry) = dir_iterator.next() {
-            // TODO: Handle errors we can recover from here, and avoid aborting everything.
-            // Also determine what errors we can recover from.
-            let entry = entry?;
-            // TODO: Is there a more direct way of comparing these?
-            if entry.file_name().to_bytes() == b"." || entry.file_name().to_bytes() == b".." {
-                continue;
-            }
-            // https://github.com/nix-rust/nix/issues/2669
-            // TODO: SAFETY: We borrow the file descriptor, but have to ensure that the dir_iterator is not dropped
-            // while the borrowed file descriptor is still in use. I'm not 100% sure on the soundness of this without
-            // consulting others.
-            let fd = unsafe { BorrowedFd::borrow_raw(dir_iterator.as_raw_fd()) };
-            match entry.file_type() {
-                None => todo!(
-                    "Need to stat the entry to determine the file type, since it wasn't provided by the filesystem"
-                ),
-                Some(nix::dir::Type::Directory) => {
-                    if let Some(on_dir_entry) = &self.on_directory_entry {
-                        on_dir_entry(&fd, dir_path, &entry)?;
-                    }
-                    //
-                    dir_names.push(entry.file_name().to_owned());
-                }
-                _ => {
-                    if let Some(on_file_entry) = &self.on_file_entry {
-                        on_file_entry(&fd, dir_path, &entry)?;
-                    }
-                }
-            }
-        }
-        match dir_names.len() {
-            // There's no directory to seed the next directory walk with, so there's nothing to do.
-            0 => Ok(None),
-            // There's exactly one directory, so we can yield it without stashing anything in the queue.
-            1 => {
-                let entry = dir_names.pop().unwrap();
-                let new_dir_path = combine_paths(dir_path, &entry);
-                return Ok(Some((dir_iterator, entry, new_dir_path)));
-            }
-            // There's more than one directory, so we stash all but one in the queue for later processing
-            _ => {
-                for entry in dir_names.drain(..dir_names.len() - 1) {
-                    let new_dir_path = combine_paths(dir_path, &entry);
-                    self.work_queue.lock_blocking().push(new_dir_path);
-                }
-                let entry = dir_names.pop().unwrap();
-                let new_dir_path = combine_paths(dir_path, &entry);
-                return Ok(Some((dir_iterator, entry, new_dir_path)));
-            }
+                    };
+                    let response_buf = bincode::serialize(&response)?;
+                    async_mpi::isend(&self.comm, &response_buf, work_request_status.source, Tag::WorkResponse as i32).await?;
+                },
+                work_ack_status = probe_work_ack => {
+                    let work_ack_status = work_ack_status?;
+                    let mut ack_buf = vec![0u8; work_ack_status.count as usize];
+                    async_mpi::irecv(&self.comm, &mut ack_buf, work_ack_status.source, Tag::WorkAck as i32).await?;
+                    self.termination_state.on_receipt_received();
+                    trace!(
+                        "Received WorkAck from rank {}",
+                        work_ack_status.source,
+                    );
+                },
+            };
+            trace!("Loop!~")
         }
     }
-}
 
-fn combine_paths(base: &CStr, entry: &CStr) -> CString {
-    // TODO: The goal here is to avoid interpreting the path as UTF-8, is there a better way to do this?
-    // TODO: Considering where we're getting this from, it should always be a valid path, even if it's not
-    // valid UTF-8, so we should be able to use the unchecked variants of this function.
-    let mut combined = Vec::with_capacity(base.len() + entry.len() + 1);
-    combined.extend_from_slice(base.to_bytes());
-    combined.push(b'/');
-    combined.extend_from_slice(entry.to_bytes());
-    combined.push(0);
-    CString::from_vec_with_nul(combined).expect("Combined path contained null byte!")
+    async fn detect_termination(&self) -> Result<(), CircleError> {
+        self.termination_state.monitor_termination(&self.comm).await
+    }
 }

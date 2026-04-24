@@ -1,9 +1,10 @@
 use clap::Parser;
-use std::{io, path::Path};
+use std::io;
+use tracing::{Level, debug, span, trace};
+use tracing_subscriber::EnvFilter;
 
 use circlers::Circle;
 use ferrompi::Mpi;
-use smol::Task;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -11,22 +12,25 @@ struct Args {
 }
 
 fn main() -> io::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
     let args = Args::parse();
-    let mpi = Mpi::init_thread(ferrompi::ThreadLevel::Funneled)
-        .map_err(|e| std::io::Error::new(io::ErrorKind::Other, e))?;
+    let mpi = Mpi::init_thread(ferrompi::ThreadLevel::Funneled).map_err(std::io::Error::other)?;
     let world = mpi.world();
-    println!("Hello from rank {} of {}", world.rank(), world.size());
+    let span = span!(Level::INFO, "process", rank = world.rank(),);
+    let _enter = span.enter();
 
     let topology = world.topology(&mpi).unwrap();
     if world.rank() == 0 {
-        println!("{topology}");
+        debug!("{topology}");
     }
     let mut circle = Circle::new(&world).unwrap();
     // TODO: Currently using a local executor so that I don't have to consider the thread safety of the MPI
     // Communicator. In the future, we should determine the executor (and number of spawned threads).
     let runtime = smol::LocalExecutor::new();
     let _result = smol::block_on(runtime.run::<io::Result<()>>(async {
-        let _res = circle.walk_files_with_seed(&args.root_directory).await;
+        circle.start_walk(Some(args.root_directory.as_ref())).await;
         Ok(())
     }));
 
