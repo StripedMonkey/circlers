@@ -62,7 +62,7 @@ enum WorkResponse {
 #[derive(Debug)]
 pub enum CircleError {
     Mpi(ferrompi::Error),
-    Serialization(Box<bincode::ErrorKind>),
+    Serialization(postcard::Error),
     InvalidMessageCount(i64),
     NoPeerRanks,
 }
@@ -88,8 +88,8 @@ impl From<ferrompi::Error> for CircleError {
     }
 }
 
-impl From<Box<bincode::ErrorKind>> for CircleError {
-    fn from(value: Box<bincode::ErrorKind>) -> Self {
+impl From<postcard::Error> for CircleError {
+    fn from(value: postcard::Error) -> Self {
         Self::Serialization(value)
     }
 }
@@ -251,7 +251,7 @@ impl Circle {
                     async_mpi::receive_tagged(&self.comm, candidate, Tag::WorkResponse as i32)
                         .await?;
 
-                let response: WorkResponse = bincode::deserialize(&response_buf)?;
+                let response: WorkResponse = postcard::from_bytes(&response_buf)?;
                 if let WorkResponse::Work(paths) = response {
                     let work = paths
                         .into_iter()
@@ -314,7 +314,7 @@ impl Circle {
                             WorkResponse::Work(shared_work)
                         }
                     };
-                    let response_buf = bincode::serialize(&response)?;
+                    let response_buf = postcard::to_allocvec(&response)?;
                     async_mpi::isend(&self.comm, &response_buf, work_request_status.source, Tag::WorkResponse as i32).await?;
                 },
                 work_ack_status = probe_work_ack => {

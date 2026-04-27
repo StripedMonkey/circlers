@@ -119,7 +119,7 @@ impl TerminationDetectionState {
                     }
                     TokenColor::White => *token_color,
                 };
-                let token_buf = bincode::serialize(&token)?;
+                let token_buf = postcard::to_allocvec(&token)?;
                 async_mpi::isend(comm, &token_buf, parent_rank, Tag::TerminationToken as i32)
                     .await?;
             }
@@ -141,7 +141,7 @@ impl TerminationDetectionState {
 
         for mut token in queued_tokens.drain(..) {
             token.color = TokenColor::White;
-            let token_buf = bincode::serialize(&token)?;
+            let token_buf = postcard::to_allocvec(&token)?;
             async_mpi::isend(
                 comm,
                 &token_buf,
@@ -189,7 +189,7 @@ impl TerminationDetectionState {
                     "Forwarding token originating from rank {} with color {:?} to parent rank {parent_rank}",
                     token.originating_rank, token.color
                 );
-                let token_buf = bincode::serialize(&token)?;
+                let token_buf = postcard::to_allocvec(&token)?;
                 async_mpi::isend(comm, &token_buf, parent_rank, Tag::TerminationToken as i32)
                     .await?;
             }
@@ -248,7 +248,7 @@ impl TerminationDetectionState {
                 // We've received a token from a child
                 token = async_mpi::receive_tagged(comm, SOURCE_ANY, Tag::TerminationToken as i32).fuse() => {
                     let token = token?;
-                    let token: Token = bincode::deserialize(&token)?;
+                    let token: Token = postcard::from_bytes(&token)?;
                     trace!("Received token originating from rank {} with color {:?}", token.originating_rank, token.color);
                     self.on_token_received(comm, token).await?;
                 },
