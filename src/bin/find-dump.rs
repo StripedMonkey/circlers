@@ -11,6 +11,19 @@ struct Args {
     root_directory: String,
 }
 
+// TODO:
+// 1. Gather statistics about the walk, i.e the number of directories, files, and total size of files, failures, timing
+//    information, and log them to stdout.
+// 2. Clean up the Circle API
+//    a. There should be some more rational choices w.r.t callbacks and exposing the results (and errors) of the walk.
+//    b. It's possible that we want to make the thread-local execution internal to Circle. Considering the dependence on
+//       the MPI to be initialized as `Funneled`, this may not be ideal.
+// 3. Add functionality to write results per-rank to a tmpfile somewhere, and gather the results at the end.
+// 4. Come up with a test suite to benchmark the walker and the MPI portions, sweeping through different
+//    parameterizations.
+// 5. Add some debug scripts to characterize the filesystem in a way that makes it easy to reproduce for later benches
+//    and testing.
+
 fn main() -> io::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -33,6 +46,8 @@ fn main() -> io::Result<()> {
         circle.start_walk(Some(args.root_directory.as_ref())).await;
         Ok(())
     }));
-
+    world
+        .barrier()
+        .expect("Error waiting for all processes to finish walking");
     Ok(())
 }

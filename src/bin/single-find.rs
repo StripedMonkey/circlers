@@ -13,6 +13,7 @@ fn main() -> io::Result<()> {
         .with_max_level(tracing::Level::TRACE)
         .init();
     let args = Args::parse();
+    let root = args.root_directory.as_ref();
     let runtime = smol::LocalExecutor::new();
     let _result = smol::block_on(runtime.run::<io::Result<()>>(async {
         let mut walker = Walker::new();
@@ -24,7 +25,7 @@ fn main() -> io::Result<()> {
             println!("File entry: {:?}", name);
             Ok(())
         });
-        walker.walk(args.root_directory.as_ref()).await?;
+        walker.walk(root).await?;
         Ok(())
     }));
 

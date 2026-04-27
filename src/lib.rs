@@ -26,6 +26,7 @@ pub struct Circle {
     on_dir_entry: OnEntryCallback,
 }
 
+// TODO: There are libraries that make this kind of thing saner. Use one.
 /// Tag for sending and receiving messages between ranks.
 #[derive(Debug, Clone, Copy)]
 #[repr(i32)]
@@ -137,6 +138,8 @@ impl Circle {
         self.on_dir_entry = callback;
     }
 
+    // Walk the provided file tree starting at `path`. When no path is provided, request work from other ranks until
+    // termination is signaled.
     pub async fn start_walk(&mut self, path: Option<&Path>) {
         let mut walker = walker::Walker::new();
 
@@ -144,7 +147,7 @@ impl Circle {
         walker.set_on_directory_entry(self.on_dir_entry);
 
         if let Some(path) = path {
-            walker.push_new([path]).await.unwrap();
+            walker.extend_queue([path]).await.unwrap();
         }
 
         // At this point, we have two tasks we need to run concurrently:
@@ -176,10 +179,12 @@ impl Circle {
             );
             // We've completed all the work we have available to us, and we have to wait for more work to arrive or for
             // termination to be detected.
-            // TODO: We're considered idle right now. This would be the point to notify the termination detection if we
-            // need to.
             // We need to now start making progress on termination detection
             trace!("Locally idle, polling for more work or termination");
+            // TODO: We initialize the termination detection task here, since we don't need to make progress on
+            // termination until we're locally idle, but this means that we drop our termination_detection task each
+            // loop. Validate whether this can cause issues if we drop the task at the wrong time. Initial testing seems
+            // to indicate this doesn't cause any permanent hangs, but it could simply be rare.
             let handle_termination_detection = self.detect_termination().fuse();
             pin!(handle_termination_detection);
             select! {
@@ -193,7 +198,7 @@ impl Circle {
                     Ok(work) => {
                         self.locally_idle.store(false, std::sync::atomic::Ordering::SeqCst);
                         debug!("Received {} work items from another rank", work.len());
-                        walker.push_new(work).await.unwrap();
+                        walker.extend_queue(work).await.unwrap();
                         continue;
                     },
                     Err(e) => {
@@ -213,6 +218,7 @@ impl Circle {
         }
     }
 
+    /// Request work from other ranks. This will retry until it receives work from another rank.
     async fn request_work(&self) -> Result<Vec<PathBuf>, CircleError> {
         let rank = self.comm.rank();
         let size = self.comm.size();
@@ -222,6 +228,9 @@ impl Circle {
         }
 
         loop {
+            // TODO: Make it easier to choose the work request strategy for benchmarking purposes.
+            // The current method chooses a random order each loop to request work from, theoretically ensuring that all
+            // ranks have an equal probability of choosing each other rank.
             // Choose a random priority order to request work from.
             let mut candidates: Vec<i32> =
                 (0..size).filter(|&candidate| candidate != rank).collect();
@@ -261,7 +270,7 @@ impl Circle {
         }
     }
 
-    /// Handle incoming work requests, acks, and tokens
+    /// Handle incoming work requests and acks from ranks we've given work to.
     async fn work_loop(
         &self,
         queue: Arc<smol::lock::Mutex<Vec<CString>>>,

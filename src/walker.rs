@@ -30,6 +30,9 @@ pub type OnEntryCallback = fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>;
 pub struct Walker {
     // TODO: Consider if there is a better data structure for stashing directories in the queue.
     queue: Arc<Mutex<Vec<CString>>>,
+    // TODO: There are performance implications using optional function pointers. Experiment with using generic function
+    // parameterization a la `F: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>` and see if there's a performance bump
+    // from the monomorphization of the callbacks.
     on_file_entry: Option<OnEntryCallback>,
     on_directory_entry: Option<OnEntryCallback>,
 }
@@ -51,10 +54,18 @@ impl Walker {
         self.on_directory_entry = Some(callback);
     }
 
+    // TODO: This probably isn't the most sane way to expose the queue. Used for being able to extract portions of the
+    // queue for work-sharing.
+    /// Get a reference counted mutex exposing the internal directory queue.
+    ///
+    /// Paths in this queue do not have any fds associated with them.
     pub fn get_queue(&self) -> Arc<Mutex<Vec<CString>>> {
         self.queue.clone()
     }
 
+    /// Get the length of the internal directory queue.
+    ///
+    /// Note that this requires locking the queue.
     pub fn queue_len(&self) -> usize {
         self.queue.lock_blocking().len()
     }
@@ -67,7 +78,8 @@ impl Walker {
         self.work_directory_queue().await
     }
 
-    pub async fn push_new<I: IntoIterator<Item = impl AsRef<Path>>>(
+    /// Extend the internal directory queue with the provided iterator of `Path`s.
+    pub async fn extend_queue<I: IntoIterator<Item = impl AsRef<Path>>>(
         &self,
         paths: I,
     ) -> nix::Result<()> {
