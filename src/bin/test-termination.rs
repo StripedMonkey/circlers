@@ -20,7 +20,7 @@ fn main() -> io::Result<()> {
         debug!("{topology}");
     }
 
-    let mut circle = Circle::new(&world).map_err(std::io::Error::other)?;
+    let mut circle = Circle::new(&world, |_,_,_| Ok(()), |_,_,_| Ok(())).map_err(std::io::Error::other)?;
     let runtime = smol::LocalExecutor::new();
 
     let start = Instant::now();

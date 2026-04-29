@@ -247,9 +247,9 @@ impl TerminationDetectionState {
             select! {
                 // We've received a token from a child
                 token = async_mpi::receive_tagged(comm, SOURCE_ANY, Tag::TerminationToken as i32).fuse() => {
-                    let token = token?;
+                    let (source, token) = token?;
                     let token: Token = postcard::from_bytes(&token)?;
-                    trace!("Received token originating from rank {} with color {:?}", token.originating_rank, token.color);
+                    trace!("Received token from {} originating from rank {} with color {:?}", source, token.originating_rank, token.color);
                     self.on_token_received(comm, token).await?;
                 },
                 // We've received a termination notification, so we can exit gracefully.

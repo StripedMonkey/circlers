@@ -1,6 +1,7 @@
 use clap::Parser;
 use std::io;
-use tracing::{Level, debug, span, trace};
+use std::{io::Write, sync::Mutex};
+use tracing::{Level, debug, span};
 use tracing_subscriber::EnvFilter;
 
 use circlers::Circle;
@@ -38,7 +39,26 @@ fn main() -> io::Result<()> {
     if world.rank() == 0 {
         debug!("{topology}");
     }
-    let mut circle = Circle::new(&world).unwrap();
+    let mut output =
+        Mutex::new(std::fs::File::create(format!("{}.out.txt", world.rank())).unwrap());
+    let mut circle = Circle::new(
+        &world,
+        move |fd, path, entry| {
+            // Handle file entry
+            writeln!(
+                output.lock().unwrap(),
+                "{}/{}",
+                path.to_string_lossy(),
+                entry.file_name().to_string_lossy()
+            ).unwrap();
+            Ok(())
+        },
+        |fd, path, entry| {
+            // Handle directory entry
+            Ok(())
+        },
+    )
+    .unwrap();
     // TODO: Currently using a local executor so that I don't have to consider the thread safety of the MPI
     // Communicator. In the future, we should determine the executor (and number of spawned threads).
     let runtime = smol::LocalExecutor::new();

@@ -16,15 +16,16 @@ fn main() -> io::Result<()> {
     let root = args.root_directory.as_ref();
     let runtime = smol::LocalExecutor::new();
     let _result = smol::block_on(runtime.run::<io::Result<()>>(async {
-        let mut walker = Walker::new();
-        walker.set_on_directory_entry(|_fd, name, _entry| {
-            println!("Directory entry: {:?}", name);
-            Ok(())
-        });
-        walker.set_on_file_entry(|_fd, name, _entry| {
-            println!("File entry: {:?}", name);
-            Ok(())
-        });
+        let mut walker = Walker::new(
+            |_fd, name, _entry| {
+                println!("File entry: {:?}", name);
+                Ok(())
+            },
+            |_fd, name, _entry| {
+                println!("Directory entry: {:?}", name);
+                Ok(())
+            },
+        );
         walker.walk(root).await?;
         Ok(())
     }));

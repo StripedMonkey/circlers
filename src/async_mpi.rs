@@ -81,11 +81,13 @@ pub async fn isend(
     wrap_request(request).await
 }
 
+/// Receives a tagged message of vectored type `T` from the specified source and tag. `T` must be an `MpiDatatype`, and
+/// the number of elements received is determined by the count returned by the probe.
 pub async fn receive_tagged<T>(
     comm: &Communicator,
     source: i32,
     tag: i32,
-) -> ferrompi::Result<Vec<T>>
+) -> ferrompi::Result<(i32, Vec<T>)>
 where
     T: MpiDatatype,
 {
@@ -93,16 +95,17 @@ where
     let mut buf: Vec<T> = Vec::with_capacity(status.count as usize);
     wrap_request(comm.irecv(
         unsafe { buf.spare_capacity_mut().assume_init_mut() },
-        source,
+        status.source,
         tag,
     )?)
     .await?;
     trace!(
-        "Successfully received tagged message from source {source} with tag {tag:?}",
+        "Successfully received tagged message from source {} with tag {tag:?}",
+        status.source,
         tag = Tag::from(tag)
     );
     unsafe {
         buf.set_len(status.count as usize);
     }
-    Ok(buf)
+    Ok((status.source, buf))
 }

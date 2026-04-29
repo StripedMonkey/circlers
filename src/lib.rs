@@ -3,27 +3,28 @@ pub mod termination_detector;
 pub mod walker;
 
 use std::{
-    ffi::CString,
-    os::unix::ffi::OsStringExt,
+    ffi::{CStr, CString},
+    os::{fd::AsFd, unix::ffi::OsStringExt},
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
 };
 
 use ferrompi::Communicator;
 use futures::{FutureExt as _, select};
+use nix::dir::Entry;
 use rand::{Rng as _, seq::SliceRandom as _};
 use serde::{Deserialize, Serialize};
 use smol::pin;
 use tracing::{debug, trace};
 
-use crate::{termination_detector::TerminationDetectionState, walker::OnEntryCallback};
+use crate::termination_detector::TerminationDetectionState;
 
-pub struct Circle {
+pub struct Circle<F1, F2> {
     comm: Communicator,
     locally_idle: AtomicBool,
     termination_state: TerminationDetectionState,
-    on_file_entry: OnEntryCallback,
-    on_dir_entry: OnEntryCallback,
+    on_file_entry: F1,
+    on_dir_entry: F2,
 }
 
 // TODO: There are libraries that make this kind of thing saner. Use one.
@@ -117,34 +118,32 @@ impl From<postcard::Error> for CircleError {
 //       but surely there are even better strategies. It seems like the author tried the random queue splitting
 //       and that was fast enough that the syscall overhead dominated, so they didn't continue further.
 
-impl Circle {
-    pub fn new(world: &Communicator) -> Result<Self, ferrompi::Error> {
+impl<F1, F2> Circle<F1, F2>
+where
+    F1: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+    F2: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+{
+    pub fn new(
+        world: &Communicator,
+        on_file_entry: F1,
+        on_dir_entry: F2,
+    ) -> Result<Self, ferrompi::Error>
+    {
         let comm = world.duplicate()?;
         let term_detector = TerminationDetectionState::new(&comm);
         Ok(Circle {
             comm,
             locally_idle: AtomicBool::new(false),
             termination_state: term_detector,
-            on_file_entry: |_, _, _| Ok(()),
-            on_dir_entry: |_, _, _| Ok(()),
+            on_file_entry,
+            on_dir_entry,
         })
-    }
-
-    pub fn set_on_file_entry(&mut self, callback: OnEntryCallback) {
-        self.on_file_entry = callback;
-    }
-
-    pub fn set_on_dir_entry(&mut self, callback: OnEntryCallback) {
-        self.on_dir_entry = callback;
     }
 
     // Walk the provided file tree starting at `path`. When no path is provided, request work from other ranks until
     // termination is signaled.
     pub async fn start_walk(&mut self, path: Option<&Path>) {
-        let mut walker = walker::Walker::new();
-
-        walker.set_on_file_entry(self.on_file_entry);
-        walker.set_on_directory_entry(self.on_dir_entry);
+        let walker = walker::Walker::new(&self.on_file_entry, &self.on_dir_entry);
 
         if let Some(path) = path {
             walker.extend_queue([path]).await.unwrap();
@@ -180,6 +179,10 @@ impl Circle {
             // We've completed all the work we have available to us, and we have to wait for more work to arrive or for
             // termination to be detected.
             // We need to now start making progress on termination detection
+            if self.comm.size() == 1 {
+                debug!("Only one rank in communicator, skipping termination detection");
+                break;
+            }
             trace!("Locally idle, polling for more work or termination");
             // TODO: We initialize the termination detection task here, since we don't need to make progress on
             // termination until we're locally idle, but this means that we drop our termination_detection task each
@@ -247,7 +250,7 @@ impl Circle {
                 )
                 .await?;
 
-                let response_buf =
+                let (_source, response_buf) =
                     async_mpi::receive_tagged(&self.comm, candidate, Tag::WorkResponse as i32)
                         .await?;
 
@@ -284,20 +287,14 @@ impl Circle {
             // Check for WorkRequest
             let probe_work_request =
                 async_mpi::probe_tag(&self.comm, SOURCE_ANY, Tag::WorkRequest as i32).fuse();
-            let probe_work_ack =
-                async_mpi::probe_tag(&self.comm, SOURCE_ANY, Tag::WorkAck as i32).fuse();
             pin!(probe_work_request);
-            pin!(probe_work_ack);
             select! {
-                work_request_status = probe_work_request => {
-                    let work_request_status = work_request_status?;
-                    trace!("Received WorkRequest from rank {}", work_request_status.source);
-                    let mut request_buf = vec![0u8; work_request_status.count as usize];
-                    async_mpi::irecv(&self.comm, &mut request_buf, work_request_status.source, Tag::WorkRequest as i32).await?;
+                work_request_status = async_mpi::receive_tagged(&self.comm, SOURCE_ANY, Tag::WorkRequest as i32).fuse() => {
+                    let (source, _work_request_status): (i32, Vec<u8>) = work_request_status?;
                     let response = {
                         let mut queue_guard = queue.lock().await;
                         if queue_guard.is_empty() {
-                            trace!("Rejecting WorkRequest from rank {} since we have no work to share", work_request_status.source);
+                            trace!("Rejecting WorkRequest from rank {} since we have no work to share", source);
                             WorkResponse::Reject
                         } else {
                             // If we're sending work, mark ourselves as black and increment pending receipts
@@ -310,21 +307,19 @@ impl Circle {
                                 let idx = rng.random_range(0..queue_guard.len());
                                 shared_work.push(queue_guard.swap_remove(idx).into_bytes());
                             }
-                            trace!("Sharing {} work items with rank {}", shared_work.len(), work_request_status.source);
+                            trace!("Sharing {} work items with rank {}", shared_work.len(), source);
                             WorkResponse::Work(shared_work)
                         }
                     };
                     let response_buf = postcard::to_allocvec(&response)?;
-                    async_mpi::isend(&self.comm, &response_buf, work_request_status.source, Tag::WorkResponse as i32).await?;
+                    async_mpi::isend(&self.comm, &response_buf, source, Tag::WorkResponse as i32).await?;
                 },
-                work_ack_status = probe_work_ack => {
-                    let work_ack_status = work_ack_status?;
-                    let mut ack_buf = vec![0u8; work_ack_status.count as usize];
-                    async_mpi::irecv(&self.comm, &mut ack_buf, work_ack_status.source, Tag::WorkAck as i32).await?;
+                work_ack = async_mpi::receive_tagged(&self.comm, SOURCE_ANY, Tag::WorkAck as i32).fuse() => {
+                    let (source, _work_ack_status): (i32, Vec<u8>) = work_ack?;
                     self.termination_state.on_receipt_received();
                     trace!(
                         "Received WorkAck from rank {}",
-                        work_ack_status.source,
+                        source,
                     );
                 },
             };

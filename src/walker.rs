@@ -25,33 +25,33 @@ use tracing::error;
 /// 2. `&CStr`: The path of the directory containing the entry.
 /// 3. `&Entry`: The directory entry itself. The only information this contains is the file type, the file name, and
 ///    inode.
-pub type OnEntryCallback = fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>;
+pub type OnEntryCallbackPtr = fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>;
 
-pub struct Walker {
+pub struct Walker<F1, F2>
+where
+    F1: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+    F2: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+{
     // TODO: Consider if there is a better data structure for stashing directories in the queue.
     queue: Arc<Mutex<Vec<CString>>>,
     // TODO: There are performance implications using optional function pointers. Experiment with using generic function
     // parameterization a la `F: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>` and see if there's a performance bump
     // from the monomorphization of the callbacks.
-    on_file_entry: Option<OnEntryCallback>,
-    on_directory_entry: Option<OnEntryCallback>,
+    on_file_entry: F1,
+    on_directory_entry: F2,
 }
 
-impl Walker {
-    pub fn new() -> Self {
+impl<F1, F2> Walker<F1, F2>
+where
+    F1: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+    F2: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+{
+    pub fn new(on_file_entry: F1, on_directory_entry: F2) -> Self {
         Self {
             queue: Arc::new(Mutex::new(Vec::new())),
-            on_file_entry: None,
-            on_directory_entry: None,
+            on_file_entry,
+            on_directory_entry,
         }
-    }
-
-    pub fn set_on_file_entry(&mut self, callback: OnEntryCallback) {
-        self.on_file_entry = Some(callback);
-    }
-
-    pub fn set_on_directory_entry(&mut self, callback: OnEntryCallback) {
-        self.on_directory_entry = Some(callback);
     }
 
     // TODO: This probably isn't the most sane way to expose the queue. Used for being able to extract portions of the
@@ -201,16 +201,11 @@ impl Walker {
                     "Need to stat the entry to determine the file type, since it wasn't provided by the filesystem"
                 ),
                 Some(nix::dir::Type::Directory) => {
-                    if let Some(on_dir_entry) = &self.on_directory_entry {
-                        on_dir_entry(&fd, dir_path, &entry)?;
-                    }
-                    //
+                    (self.on_directory_entry)(&fd, dir_path, &entry)?;
                     dir_names.push(entry.file_name().to_owned());
                 }
                 _ => {
-                    if let Some(on_file_entry) = &self.on_file_entry {
-                        on_file_entry(&fd, dir_path, &entry)?;
-                    }
+                    (self.on_file_entry)(&fd, dir_path, &entry)?;
                 }
             }
         }
@@ -237,11 +232,6 @@ impl Walker {
     }
 }
 
-impl Default for Walker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 fn combine_paths(base: &CStr, entry: &CStr) -> CString {
     // TODO: The goal here is to avoid interpreting the path as UTF-8, is there a better way to do this?
@@ -253,4 +243,11 @@ fn combine_paths(base: &CStr, entry: &CStr) -> CString {
     combined.extend_from_slice(entry.to_bytes());
     combined.push(0);
     CString::from_vec_with_nul(combined).expect("Combined path contained null byte!")
+}
+
+fn nothing_walker() -> Walker<
+    impl Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+    impl Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+> {
+    Walker::new(|_, _, _| Ok(()), |_, _, _| Ok(()))
 }
