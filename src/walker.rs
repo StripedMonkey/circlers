@@ -27,11 +27,7 @@ use tracing::error;
 ///    inode.
 pub type OnEntryCallbackPtr = fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>;
 
-pub struct Walker<F1, F2>
-where
-    F1: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
-    F2: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
-{
+pub struct Walker<F1, F2> {
     // TODO: Consider if there is a better data structure for stashing directories in the queue.
     queue: Arc<Mutex<Vec<CString>>>,
     // TODO: There are performance implications using optional function pointers. Experiment with using generic function
@@ -232,7 +228,6 @@ where
     }
 }
 
-
 fn combine_paths(base: &CStr, entry: &CStr) -> CString {
     // TODO: The goal here is to avoid interpreting the path as UTF-8, is there a better way to do this?
     // TODO: Considering where we're getting this from, it should always be a valid path, even if it's not
@@ -245,7 +240,7 @@ fn combine_paths(base: &CStr, entry: &CStr) -> CString {
     CString::from_vec_with_nul(combined).expect("Combined path contained null byte!")
 }
 
-fn nothing_walker() -> Walker<
+pub fn nothing_walker() -> Walker<
     impl Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
     impl Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
 > {

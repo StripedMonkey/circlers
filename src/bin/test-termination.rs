@@ -10,7 +10,7 @@ fn main() -> io::Result<()> {
         .init();
     let mpi = Mpi::init_thread(ferrompi::ThreadLevel::Funneled).map_err(std::io::Error::other)?;
     let world = mpi.world();
-    let span = span!(Level::INFO,"process", rank = world.rank(),);
+    let span = span!(Level::INFO, "process", rank = world.rank(),);
     let _enter = span.enter();
     debug!("Rank {} of {} started", world.rank(), world.size());
 
@@ -20,12 +20,14 @@ fn main() -> io::Result<()> {
         debug!("{topology}");
     }
 
-    let mut circle = Circle::new(&world, |_,_,_| Ok(()), |_,_,_| Ok(())).map_err(std::io::Error::other)?;
+    let mut circle = Circle::new(&world).map_err(std::io::Error::other)?;
     let runtime = smol::LocalExecutor::new();
 
     let start = Instant::now();
     let _result = smol::block_on(runtime.run::<io::Result<()>>(async {
-        circle.start_walk(None).await;
+        circle
+            .start_walk(None, |_, _, _| Ok(()), |_, _, _| Ok(()))
+            .await;
         info!(
             "Rank {} walk completed in {:?}",
             world.rank(),

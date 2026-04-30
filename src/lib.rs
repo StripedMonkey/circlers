@@ -19,12 +19,10 @@ use tracing::{debug, trace};
 
 use crate::termination_detector::TerminationDetectionState;
 
-pub struct Circle<F1, F2> {
+pub struct Circle {
     comm: Communicator,
     locally_idle: AtomicBool,
     termination_state: TerminationDetectionState,
-    on_file_entry: F1,
-    on_dir_entry: F2,
 }
 
 // TODO: There are libraries that make this kind of thing saner. Use one.
@@ -118,32 +116,27 @@ impl From<postcard::Error> for CircleError {
 //       but surely there are even better strategies. It seems like the author tried the random queue splitting
 //       and that was fast enough that the syscall overhead dominated, so they didn't continue further.
 
-impl<F1, F2> Circle<F1, F2>
-where
-    F1: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
-    F2: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
-{
+impl Circle {
     pub fn new(
         world: &Communicator,
-        on_file_entry: F1,
-        on_dir_entry: F2,
-    ) -> Result<Self, ferrompi::Error>
-    {
+    ) -> Result<Self, ferrompi::Error> {
         let comm = world.duplicate()?;
         let term_detector = TerminationDetectionState::new(&comm);
         Ok(Circle {
             comm,
             locally_idle: AtomicBool::new(false),
             termination_state: term_detector,
-            on_file_entry,
-            on_dir_entry,
         })
     }
 
     // Walk the provided file tree starting at `path`. When no path is provided, request work from other ranks until
     // termination is signaled.
-    pub async fn start_walk(&mut self, path: Option<&Path>) {
-        let walker = walker::Walker::new(&self.on_file_entry, &self.on_dir_entry);
+    pub async fn start_walk<F1, F2>(&mut self, path: Option<&Path>, on_file_entry: F1, on_dir_entry: F2)
+    where
+        F1: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+        F2: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+    {
+        let walker = walker::Walker::new(on_file_entry, on_dir_entry);
 
         if let Some(path) = path {
             walker.extend_queue([path]).await.unwrap();
