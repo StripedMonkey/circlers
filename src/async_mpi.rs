@@ -93,12 +93,27 @@ where
 {
     let status = probe_tag(comm, source, tag).await?;
     let mut buf: Vec<T> = Vec::with_capacity(status.count as usize);
-    wrap_request(comm.irecv(
+    let (actual_source, actual_tag, actual_count) = comm.recv(
         unsafe { buf.spare_capacity_mut().assume_init_mut() },
         status.source,
         tag,
-    )?)
-    .await?;
+    )?;
+    assert!(
+        actual_tag == tag,
+        "Received message with unexpected tag: expected {tag:?}, got {actual_tag:?}"
+    );
+    assert!(
+        actual_count == status.count,
+        "Received message with unexpected count: expected {}, got {}",
+        status.count,
+        actual_count
+    );
+    assert!(
+        actual_source == status.source,
+        "Received message from unexpected source: expected {}, got {}",
+        status.source,
+        actual_source
+    );
     trace!(
         "Successfully received tagged message from source {} with tag {tag:?}",
         status.source,
