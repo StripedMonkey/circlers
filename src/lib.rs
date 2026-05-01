@@ -62,7 +62,6 @@ enum WorkResponse {
 pub enum CircleError {
     Mpi(ferrompi::Error),
     Serialization(postcard::Error),
-    InvalidMessageCount(i64),
     NoPeerRanks,
 }
 
@@ -71,9 +70,6 @@ impl std::fmt::Display for CircleError {
         match self {
             CircleError::Mpi(err) => write!(f, "MPI error: {err}"),
             CircleError::Serialization(err) => write!(f, "Serialization error: {err}"),
-            CircleError::InvalidMessageCount(count) => {
-                write!(f, "Invalid message count from MPI status: {count}")
-            }
             CircleError::NoPeerRanks => write!(f, "Cannot request work without peer ranks"),
         }
     }
@@ -277,10 +273,6 @@ impl Circle {
         // 3. Token: receive the token for distributed termination detection
         // 4. TerminationConfirmed: receive confirmation that termination has been detected and we can exit
         loop {
-            // Check for WorkRequest
-            let probe_work_request =
-                async_mpi::probe_tag(&self.comm, SOURCE_ANY, Tag::WorkRequest as i32).fuse();
-            pin!(probe_work_request);
             select! {
                 work_request_status = async_mpi::receive_tagged(&self.comm, SOURCE_ANY, Tag::WorkRequest as i32).fuse() => {
                     let (source, _work_request_status): (i32, Vec<u8>) = work_request_status?;
