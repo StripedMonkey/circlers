@@ -42,7 +42,7 @@ fn main() -> io::Result<()> {
     if world.rank() == 0 {
         debug!("{topology}");
     }
-    let mut output = std::fs::File::create(format!("{}.out.txt", world.rank())).unwrap();
+    let mut output = std::fs::File::create(format!("{}.out.txt", world.rank()))?;
     let on_entry_output = &mut output;
     // https://users.rust-lang.org/t/implementation-of-fnonce-is-not-general-enough/78006/4
     let on_file_entry = |_fd: &dyn AsFd, path: &CStr, entry: &Entry| {

@@ -15,7 +15,7 @@ fn main() -> io::Result<()> {
     debug!("Rank {} of {} started", world.rank(), world.size());
 
     // Topology is collective; query on all ranks and print only on rank 0.
-    let topology = world.topology(&mpi).unwrap();
+    let topology = world.topology(&mpi).map_err(std::io::Error::other)?;
     if world.rank() == 0 {
         debug!("{topology}");
     }
