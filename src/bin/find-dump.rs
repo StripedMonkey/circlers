@@ -60,18 +60,17 @@ fn main() -> io::Result<()> {
         // Handle directory entry
         Ok(())
     };
+    let seed = if world.rank() == 0 {
+        Some(args.root_directory.as_ref())
+    } else {
+        None
+    };
     let mut circle = Circle::new(&world).unwrap();
     // TODO: Currently using a local executor so that I don't have to consider the thread safety of the MPI
     // Communicator. In the future, we should determine the executor (and number of spawned threads).
     let runtime = smol::LocalExecutor::new();
     let _result = smol::block_on(runtime.run::<io::Result<()>>(async {
-        circle
-            .start_walk(
-                Some(args.root_directory.as_ref()),
-                on_file_entry,
-                on_dir_entry,
-            )
-            .await;
+        circle.start_walk(seed, on_file_entry, on_dir_entry).await;
         Ok(())
     }));
     output.flush().unwrap();
