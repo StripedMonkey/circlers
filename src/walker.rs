@@ -245,6 +245,8 @@ fn combine_paths(base: &CStr, entry: &CStr) -> CString {
     CString::from_vec_with_nul(combined).expect("Combined path contained null byte!")
 }
 
+// The type is complex, but you can't really simplify the impl Trait without trait aliases, which are still unstable.
+#[allow(clippy::type_complexity)]
 pub fn nothing_walker() -> Walker<
     impl FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
     impl FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
