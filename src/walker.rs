@@ -39,8 +39,8 @@ pub struct Walker<F1, F2> {
 
 impl<F1, F2> Walker<F1, F2>
 where
-    F1: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
-    F2: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+    F1: FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+    F2: FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
 {
     pub fn new(on_file_entry: F1, on_directory_entry: F2) -> Self {
         Self {
@@ -66,7 +66,7 @@ where
         self.queue.lock_blocking().len()
     }
 
-    pub async fn walk(&self, root: &Path) -> nix::Result<()> {
+    pub async fn walk(&mut self, root: &Path) -> nix::Result<()> {
         self.queue
             .lock()
             .await
@@ -88,7 +88,12 @@ where
 
     /// Work on the current directory queue until it's empty, processing all available directories,
     /// calling `self.on_directory_entry` and `self.on_file_entry` as appropriate.
-    pub async fn work_directory_queue(&self) -> nix::Result<()> {
+    ///
+    /// NOTE: It's important that we take care to prevent us from dropping the `work_directory_queue` future when
+    /// it hasn't completed. If we yield while still holding a file descriptor+filename for faster processing we
+    /// will end up dropping that directory here. The solution is to keep the same walker for all work requests
+    /// until we completely drain the queue and return from the walker task.
+    pub async fn work_directory_queue(&mut self) -> nix::Result<()> {
         loop {
             // Pop a directory from the queue, or break if there's no work to do.
             let Some(dir_path) = self.queue.lock().await.pop() else {
@@ -129,6 +134,9 @@ where
                         // 3. We can yield after some number of directories
                         // 4. We can choose to never yield. This would probably break the multi-processing that we're
                         //    looking to achieve, but is technically possible.
+                        // WARN: It MAY be a logic bug if we yield while still having a held openfd+directory! We have
+                        // to ensure that the future is never canceled while we still have an open fd+directory to work
+                        // on
                         yield_now().await;
                     }
                 }
@@ -138,10 +146,10 @@ where
         Ok(())
     }
 
-    fn walk_directory_path(
-        &self,
+    fn walk_directory_path<'a>(
+        &mut self,
         dir_path: &CStr,
-    ) -> nix::Result<Option<(impl AsRawFd, CString, CString)>> {
+    ) -> nix::Result<Option<(impl AsRawFd + 'a, CString, CString)>> {
         let dir = nix::dir::Dir::open(
             dir_path,
             OFlag::O_DIRECTORY | OFlag::O_RDONLY,
@@ -150,15 +158,12 @@ where
         self.on_directory(dir, dir_path)
     }
 
-    // TODO: `walk_directory_fd` puts a lifetime on `AsRawFd` tying it to the lifetime of `self`  via
-    // `impl AsRawFd + '_`, but this isn't really necessary, as `openat` shouldn't hold onto the fd we open it with.
-    // Figure out how to remove or separate the lifetimes here.
-    fn walk_directory_fd(
-        &self,
+    fn walk_directory_fd<'a>(
+        &mut self,
         parent_fd: impl AsFd,
         dir_name: &CStr,
         dir_path: &CStr,
-    ) -> nix::Result<Option<(impl AsRawFd + '_, CString, CString)>> {
+    ) -> nix::Result<Option<(impl AsRawFd + 'a, CString, CString)>> {
         let dir = nix::dir::Dir::openat(
             parent_fd,
             dir_name,
@@ -171,11 +176,11 @@ where
     /// Walk the provided `Dir`, iterating over its entries and calling the appropriate callbacks on each. Entry. If
     /// there are any subdirectories, we stash all but one of them in the queue for later processing, and return the
     /// final directory, the parent file descriptor, and the path of the directory for later processing.
-    fn on_directory(
-        &self,
+    fn on_directory<'a>(
+        &mut self,
         dir: Dir,
         dir_path: &CStr,
-    ) -> nix::Result<Option<(impl AsRawFd + '_, CString, CString)>> {
+    ) -> nix::Result<Option<(impl AsRawFd + 'a, CString, CString)>> {
         let mut dir_iterator = dir.into_iter();
         let mut dir_names = Vec::new();
 
@@ -241,8 +246,8 @@ fn combine_paths(base: &CStr, entry: &CStr) -> CString {
 }
 
 pub fn nothing_walker() -> Walker<
-    impl Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
-    impl Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+    impl FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+    impl FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
 > {
     Walker::new(|_, _, _| Ok(()), |_, _, _| Ok(()))
 }

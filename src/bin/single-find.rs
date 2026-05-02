@@ -16,7 +16,7 @@ fn main() -> io::Result<()> {
     let root = args.root_directory.as_ref();
     let runtime = smol::LocalExecutor::new();
     let _result = smol::block_on(runtime.run::<io::Result<()>>(async {
-        let walker = Walker::new(
+        let mut walker = Walker::new(
             |_fd, name, _entry| {
                 println!("File entry: {:?}", name);
                 Ok(())

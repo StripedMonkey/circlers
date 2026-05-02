@@ -2,8 +2,8 @@ use clap::Parser;
 use nix::dir::Entry;
 use std::ffi::CStr;
 use std::io;
+use std::io::Write;
 use std::os::fd::AsFd;
-use std::{io::Write, sync::Mutex};
 use tracing::{Level, debug, span};
 use tracing_subscriber::EnvFilter;
 
@@ -42,14 +42,13 @@ fn main() -> io::Result<()> {
     if world.rank() == 0 {
         debug!("{topology}");
     }
-    let output =
-        Mutex::new(std::fs::File::create(format!("{}.out.txt", world.rank())).unwrap());
-
+    let mut output = std::fs::File::create(format!("{}.out.txt", world.rank())).unwrap();
+    let on_entry_output = &mut output;
     // https://users.rust-lang.org/t/implementation-of-fnonce-is-not-general-enough/78006/4
     let on_file_entry = |_fd: &dyn AsFd, path: &CStr, entry: &Entry| {
         // Handle file entry
         writeln!(
-            output.lock().unwrap(),
+            on_entry_output,
             "{}/{}",
             path.to_string_lossy(),
             entry.file_name().to_string_lossy()
@@ -75,6 +74,7 @@ fn main() -> io::Result<()> {
             .await;
         Ok(())
     }));
+    output.flush().unwrap();
     world
         .barrier()
         .expect("Error waiting for all processes to finish walking");

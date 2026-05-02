@@ -113,9 +113,7 @@ impl From<postcard::Error> for CircleError {
 //       and that was fast enough that the syscall overhead dominated, so they didn't continue further.
 
 impl Circle {
-    pub fn new(
-        world: &Communicator,
-    ) -> Result<Self, ferrompi::Error> {
+    pub fn new(world: &Communicator) -> Result<Self, ferrompi::Error> {
         let comm = world.duplicate()?;
         let term_detector = TerminationDetectionState::new(&comm);
         Ok(Circle {
@@ -127,12 +125,16 @@ impl Circle {
 
     // Walk the provided file tree starting at `path`. When no path is provided, request work from other ranks until
     // termination is signaled.
-    pub async fn start_walk<F1, F2>(&mut self, path: Option<&Path>, on_file_entry: F1, on_dir_entry: F2)
-    where
-        F1: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
-        F2: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+    pub async fn start_walk<F1, F2>(
+        &mut self,
+        path: Option<&Path>,
+        on_file_entry: F1,
+        on_dir_entry: F2,
+    ) where
+        F1: FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
+        F2: FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
     {
-        let walker = walker::Walker::new(on_file_entry, on_dir_entry);
+        let mut walker = walker::Walker::new(on_file_entry, on_dir_entry);
 
         if let Some(path) = path {
             walker.extend_queue([path]).await.unwrap();
@@ -146,17 +148,22 @@ impl Circle {
         let handle_work_requests = self.work_loop(walker.get_queue()).fuse();
         pin!(handle_work_requests);
         loop {
-            let walker_task = walker.work_directory_queue().fuse();
-            pin!(walker_task);
-            select! {
-                res = walker_task => {
-                    if let Err(e) = res {
-                        panic!("Error walking directory queue: {:?}", e);
+            {
+                let walker_worker = walker.work_directory_queue().fuse();
+                pin!(walker_worker);
+                'directory_work: loop {
+                    select! {
+                        res = walker_worker => {
+                            if let Err(e) = res {
+                                panic!("Error walking directory queue: {:?}", e);
+                            }
+                            break 'directory_work;
+                        },
+                        e = handle_work_requests => {
+                            panic!("Work request handling should never complete: {:?}", e);
+                        },
                     }
-                },
-                e = handle_work_requests => {
-                    panic!("Work request handling should never complete: {:?}", e);
-                },
+                }
             }
             debug_assert!(
                 walker.queue_len() == 0,
