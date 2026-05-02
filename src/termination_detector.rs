@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use smol::lock::Mutex;
 use tracing::trace;
 
-use crate::{CircleError, SOURCE_ANY, Tag, async_mpi};
+use crate::{
+    CircleError,
+    async_mpi::{self, SOURCE_ANY, Tag},
+};
 
 // Token color for Dijkstra's distributed termination algorithm.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

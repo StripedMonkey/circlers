@@ -7,7 +7,33 @@ use std::{
 use ferrompi::{Communicator, MpiDatatype};
 use tracing::trace;
 
-use crate::Tag;
+pub const SOURCE_ANY: i32 = -1;
+
+// TODO: There are libraries that make this kind of thing saner. Use one.
+/// Tag for sending and receiving messages between ranks.
+#[derive(Debug, Clone, Copy)]
+#[repr(i32)]
+pub(crate) enum Tag {
+    WorkRequest = 10,
+    WorkResponse,
+    WorkAck,
+    TerminationToken,
+    TerminationConfirmed,
+}
+
+impl From<i32> for Tag {
+    fn from(value: i32) -> Self {
+        match value {
+            10 => Tag::WorkRequest,
+            11 => Tag::WorkResponse,
+            12 => Tag::WorkAck,
+            13 => Tag::TerminationToken,
+            14 => Tag::TerminationConfirmed,
+            _ => panic!("Invalid tag value: {value}"),
+        }
+    }
+}
+
 
 struct WrappedRequest(Option<ferrompi::Request>);
 
