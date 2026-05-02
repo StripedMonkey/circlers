@@ -151,18 +151,15 @@ impl Circle {
             {
                 let walker_worker = walker.work_directory_queue().fuse();
                 pin!(walker_worker);
-                'directory_work: loop {
-                    select! {
-                        res = walker_worker => {
-                            if let Err(e) = res {
-                                panic!("Error walking directory queue: {:?}", e);
-                            }
-                            break 'directory_work;
-                        },
-                        e = handle_work_requests => {
-                            panic!("Work request handling should never complete: {:?}", e);
-                        },
-                    }
+                select! {
+                    res = walker_worker => {
+                        if let Err(e) = res {
+                            panic!("Error walking directory queue: {:?}", e);
+                        }
+                    },
+                    e = handle_work_requests => {
+                        panic!("Work request handling should never complete: {:?}", e);
+                    },
                 }
             }
             debug_assert!(
