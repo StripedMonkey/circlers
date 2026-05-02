@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
 import argparse
+import os
+import socket
+import platform
 import json
 import subprocess
 from pathlib import Path
@@ -12,7 +15,10 @@ RESULT_DIR_NAME_FORMAT = "%Y_%m_%d_%H_%M_%S"
 
 
 def run_bench(executable_path, executable_args):
+    os.chdir(git_root())
     executable_path = Path(executable_path).absolute()
+    if not executable_path.is_file():
+        raise FileNotFoundError(f"Executable not found at path: {executable_path}")
     now = datetime.now()
     dir = create_run_dir(now)
     preamble(dir)  # TODO: Rename
@@ -32,7 +38,17 @@ def run_bench(executable_path, executable_args):
         benched_command,
     ]
     print(f"Running benchmark with command: {' '.join(command)}")
-    subprocess.run(command,cwd=dir, check=True)
+    # We're not actually using this for true timing, but rather for bounding the benchmark for other data gathering.
+    start = datetime.now() 
+    subprocess.run(command, cwd=dir, check=True)
+    end = datetime.now()
+    elapsed = end - start
+
+
+def git_root():
+    command = ["git", "rev-parse", "--show-toplevel"]
+    output = subprocess.check_output(command, encoding="utf-8").strip()
+    return Path(output)
 
 
 def preamble(dir: Path):
@@ -100,9 +116,7 @@ def gather_context():
         print(f"Error gathering git information: {e}")
     # Get system information
     try:
-        context["system"] = {
-            "os": subprocess.check_output(["uname", "-s"], encoding="utf-8").strip(),
-        }
+        context["system"] = platform.uname()._asdict()
     except Exception as e:
         print(f"Error gathering system information: {e}")
     return context
