@@ -45,8 +45,8 @@ impl From<postcard::Error> for CircleError {
 impl From<CircleError> for std::io::Error {
     fn from(value: CircleError) -> Self {
         match value {
-            CircleError::Mpi(err) => std::io::Error::new(std::io::ErrorKind::Other, err),
-            CircleError::Serialization(err) => std::io::Error::new(std::io::ErrorKind::Other, err),
+            CircleError::Mpi(err) => std::io::Error::other(err),
+            CircleError::Serialization(err) => std::io::Error::other(err),
         }
     }
 }
