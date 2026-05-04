@@ -233,7 +233,7 @@ where
     }
 }
 
-fn combine_paths(base: &CStr, entry: &CStr) -> CString {
+pub fn combine_paths(base: &CStr, entry: &CStr) -> CString {
     // TODO: The goal here is to avoid interpreting the path as UTF-8, is there a better way to do this?
     // TODO: Considering where we're getting this from, it should always be a valid path, even if it's not
     // valid UTF-8, so we should be able to use the unchecked variants of this function.
