@@ -2,9 +2,9 @@
 
 import argparse
 import os
-import socket
 import platform
 import json
+import hashlib
 import subprocess
 from pathlib import Path
 from datetime import datetime
@@ -21,16 +21,19 @@ def run_bench(executable_path, executable_args):
         raise FileNotFoundError(f"Executable not found at path: {executable_path}")
     now = datetime.now()
     dir = create_run_dir(now)
-    preamble(dir)  # TODO: Rename
+    preamble(dir, executable_path)  # TODO: Rename
     results_file = dir / "results.json"
     min_proc, max_proc = 1, 8
     benched_command = f"mpiexec -n {{nproc}} {executable_path} {executable_args}"
+    command_output_file = dir / "command_output.txt"
 
     command = [
         "hyperfine",
         "--export-json",
         f"{results_file}",
         "--warmup=1",
+        "--output",
+        f"{command_output_file}",
         "--parameter-scan",
         "nproc",
         f"{min_proc}",
@@ -39,7 +42,7 @@ def run_bench(executable_path, executable_args):
     ]
     print(f"Running benchmark with command: {' '.join(command)}")
     # We're not actually using this for true timing, but rather for bounding the benchmark for other data gathering.
-    start = datetime.now() 
+    start = datetime.now()
     subprocess.run(command, cwd=dir, check=True)
     end = datetime.now()
     elapsed = end - start
@@ -51,9 +54,15 @@ def git_root():
     return Path(output)
 
 
-def preamble(dir: Path):
-    # Create a unique directory for this benchmark run
+def preamble(dir: Path, executable_path: Path):
     context = gather_context()
+    with open(executable_path, "rb") as f:
+        digest = hashlib.file_digest(f, "sha256").hexdigest()
+    context["executable"] = {
+        "path": str(executable_path),
+        "hash": digest,
+    }
+
     with open(dir / "context.json", "w") as f:
         json.dump(context, f, indent=4)
     write_dirty_changes(dir / "dirty_changes.patch")
