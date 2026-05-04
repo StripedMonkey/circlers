@@ -1,5 +1,7 @@
 use clap::Parser;
 use std::io;
+use tracing::trace;
+use tracing_subscriber::EnvFilter;
 
 use circlers::walker::Walker;
 
@@ -10,7 +12,7 @@ struct Args {
 
 fn main() -> io::Result<()> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+        .with_env_filter(EnvFilter::from_default_env())
         .init();
     let args = Args::parse();
     let root = args.root_directory.as_ref();
@@ -18,11 +20,11 @@ fn main() -> io::Result<()> {
     let _result = smol::block_on(runtime.run::<io::Result<()>>(async {
         let mut walker = Walker::new(
             |_fd, name, _entry| {
-                println!("File entry: {:?}", name);
+                trace!("File entry: {:?}", name);
                 Ok(())
             },
             |_fd, name, _entry| {
-                println!("Directory entry: {:?}", name);
+                trace!("Directory entry: {:?}", name);
                 Ok(())
             },
         );

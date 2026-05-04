@@ -27,7 +27,8 @@ fn main() -> io::Result<()> {
     let _result = smol::block_on(runtime.run::<io::Result<()>>(async {
         circle
             .start_walk(None, |_, _, _| Ok(()), |_, _, _| Ok(()))
-            .await;
+            .await
+            .unwrap();
         info!(
             "Rank {} walk completed in {:?}",
             world.rank(),

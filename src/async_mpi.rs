@@ -34,7 +34,6 @@ impl From<i32> for Tag {
     }
 }
 
-
 struct WrappedRequest(Option<ferrompi::Request>);
 
 impl Future for WrappedRequest {
@@ -73,6 +72,7 @@ pub async fn probe_tag(
     loop {
         match comm.iprobe::<u8>(source, tag) {
             Ok(Some(status)) => return Ok(status),
+            // TODO: Investigate better strategies for waking.
             Ok(None) => smol::future::yield_now().await,
             Err(e) => return Err(e),
         }
@@ -108,7 +108,7 @@ pub async fn isend(
 }
 
 /// Receives a tagged message of vectored type `T` from the specified source and tag. `T` must be an `MpiDatatype`, and
-/// the number of elements received is determined by the count returned by the probe.
+/// the number of elements received is determined by the count returned by a probe.
 pub async fn receive_tagged<T>(
     comm: &Communicator,
     source: i32,

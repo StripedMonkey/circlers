@@ -2,7 +2,7 @@ use std::{
     ffi::{CStr, CString},
     os::{fd::AsFd, unix::ffi::OsStringExt},
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
+    sync::Arc,
 };
 
 use ferrompi::Communicator;
@@ -10,7 +10,7 @@ use futures::{FutureExt as _, select};
 use nix::dir::Entry;
 use rand::{Rng as _, seq::SliceRandom as _};
 use smol::pin;
-use tracing::{debug, trace};
+use tracing::{debug, error, trace};
 
 use crate::{
     CircleError, WorkResponse,
@@ -19,7 +19,8 @@ use crate::{
     walker,
 };
 
-// The main loop of the walk consists of the following tasks, running asynchronously:
+// The main loop of the walk consists of the following tasks, running asynchronously. Note not all tasks are run all the
+// time, as they're simply not necessary.
 // 1. Walking the directory tree, processing entries as they are encountered, a directory at a time. The walk
 //    is directory-wide, depth first, and distributed across the ranks. To perform the minimum number of
 //    syscalls possible, we iterate over the directory entries, stashing the directories for later processing.
@@ -28,11 +29,7 @@ use crate::{
 //    are no directories, we pop a directory from the queue and work on that one.
 //    For each entry, we call a user-provided callback as appropriate
 //
-// 2. "Making progress" on termination detection. The program is considered terminated when
-//    a. All processes are "locally terminated"
-//    b. There are no messages in transit
-//
-// 3. Responding to messages from other ranks, which consists of
+// 2. Responding to messages from other ranks, which consists of
 //    a. Requesting work (directories to process) from other ranks, if we are idle and have no work in our queue
 //    b. Responding to work requests from other ranks, if we have work in our queue, we split off a portion of
 //       our queue and send it to the requesting rank. The exact portion of the queue to send is something I
@@ -41,10 +38,13 @@ use crate::{
 //       randomized queue splitting performs better than splitting in half every time. This makes some sense,
 //       but surely there are even better strategies. It seems like the author tried the random queue splitting
 //       and that was fast enough that the syscall overhead dominated, so they didn't continue further.
+//
+// 3. "Making progress" on termination detection. The program is considered terminated when
+//    a. All processes are "locally terminated"
+//    b. There are no messages in transit
 
 pub struct Circle {
     comm: Communicator,
-    locally_idle: AtomicBool,
     termination_state: TerminationDetectionState,
 }
 
@@ -54,19 +54,20 @@ impl Circle {
         let term_detector = TerminationDetectionState::new(&comm);
         Ok(Circle {
             comm,
-            locally_idle: AtomicBool::new(false),
             termination_state: term_detector,
         })
     }
 
     // Walk the provided file tree starting at `path`. When no path is provided, request work from other ranks until
-    // termination is signaled.
+    // termination is signaled. This function does not return until termination is detected and all participating ranks
+    // exit gracefully.
     pub async fn start_walk<F1, F2>(
         &mut self,
         path: Option<&Path>,
         on_file_entry: F1,
         on_dir_entry: F2,
-    ) where
+    ) -> Result<(), CircleError>
+    where
         F1: FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
         F2: FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
     {
@@ -90,7 +91,9 @@ impl Circle {
                 select! {
                     res = walker_worker => {
                         if let Err(e) = res {
-                            panic!("Error walking directory queue: {:?}", e);
+                            error!("Error walking directory queue: {:?}", e);
+                            // We only propagate critical errors here
+                            panic!("{e:?}"); // TODO: bubble errors up if it makes sense to.
                         }
                     },
                     e = handle_work_requests => {
@@ -110,9 +113,9 @@ impl Circle {
             // We need to now start making progress on termination detection
             if self.comm.size() == 1 {
                 debug!("Only one rank in communicator, skipping termination detection");
-                break;
+                break Ok(());
             }
-            trace!("Locally idle, polling for more work or termination");
+            debug!("Locally idle, polling for more work or termination");
             // TODO: We initialize the termination detection task here, since we don't need to make progress on
             // termination until we're locally idle, but this means that we drop our termination_detection task each
             // loop. Validate whether this can cause issues if we drop the task at the wrong time. Initial testing seems
@@ -128,7 +131,6 @@ impl Circle {
                 // If we receive work, we're no longer idle, and we can go back to work by looping.
                 work = self.request_work().fuse() => match work {
                     Ok(work) => {
-                        self.locally_idle.store(false, std::sync::atomic::Ordering::SeqCst);
                         debug!("Received {} work items from another rank", work.len());
                         walker.extend_queue(work).await.unwrap();
                         continue;
@@ -144,7 +146,7 @@ impl Circle {
                     }
                     // Termination was detected, and we're currently idle, so we can terminate gracefully.
                     debug!("Termination detected, exiting");
-                    break;
+                    break Ok(());
                 },
             }
         }
