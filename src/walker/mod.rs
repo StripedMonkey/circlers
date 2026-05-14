@@ -1,10 +1,3 @@
-use nix::{
-    NixPath as _,
-    dir::{Dir, Entry},
-    fcntl::OFlag,
-    sys::stat::Mode,
-};
-use smol::{future::yield_now, lock::Mutex};
 use std::{
     ffi::{CStr, CString},
     os::{
@@ -12,29 +5,111 @@ use std::{
         unix::ffi::OsStrExt,
     },
     path::Path,
-    sync::Arc,
+    rc::Rc,
 };
-use tracing::error;
 
-/// The signature of the callback called on each entry in a directory. The callback has this signature because it is the
-/// most information we can provide about the entry without performing additional syscalls.
-/// The parameters are as follows:
-/// 1. `&dyn AsFd`: An open file descriptor for the directory containing the entry. Used so that you can grab additional
-///    information about the entry, if necessary, by using the `fstatat` or similar *at calls that can take a file
-///    descriptor.
-/// 2. `&CStr`: The path of the directory containing the entry.
-/// 3. `&Entry`: The directory entry itself. The only information this contains is the file type, the file name, and
-///    inode.
-pub type OnEntryCallbackPtr = fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>;
+use nix::{
+    dir::{Dir, Entry, Type},
+    fcntl::{AtFlags, OFlag},
+    sys::stat::{self, Mode, SFlag},
+};
+use smol::{future::yield_now, lock::Mutex};
+use tracing::warn;
+
+#[derive(Debug)]
+pub enum WalkerError {
+    Nix(nix::Error),
+}
+
+impl From<nix::Error> for WalkerError {
+    fn from(e: nix::Error) -> Self {
+        WalkerError::Nix(e)
+    }
+}
+
+impl std::fmt::Display for WalkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalkerError::Nix(e) => write!(f, "nix error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for WalkerError {}
+
+/// An open directory whose subdirectory names have been enumerated but not yet walked.
+///
+/// `fd` holds a boxed `OwningIter` (produced by `Dir::into_iter()`). There is no way to extract the `Dir` back from an
+/// `OwningIter` once iteration begins, so we erase its type to `dyn AsRawFd` while preserving ownership and the
+/// underlying fd for future `Dir::openat` calls on each pending subdir. (`OwningIter` implements `AsRawFd` but not
+/// `AsFd`, so we use the raw fd form and construct `BorrowedFd` manually when needed.)
+struct DirectoryEntries {
+    fd: Box<dyn AsRawFd>,
+    dir_path: CString,
+    pending_subdirs: Vec<CString>,
+}
+
+struct Queue {
+    // TODO: The hot queue holds an opened file descriptor for each directory parent, this might be a lot. At the moment
+    // because we're essentially doing a depth-first walk, we will only have depth(tree) fds open at once, which is a
+    // reasonable-ish assumption but might cause issues. Consider ensuring that we limit the number of "hot" entries and
+    // keep an upper bound number of items.
+    /// Directories with open fds; children are opened via `Dir::openat(fd, name)`.
+    hot: Vec<DirectoryEntries>,
+    /// Full paths with no cached fd; opened via `Dir::open(full_path)`. Populated by external work injection (MPI or the
+    /// initial `walk()` seed).
+    cold: Vec<CString>,
+}
+
+impl Queue {
+    fn new() -> Self {
+        Queue {
+            hot: Vec::new(),
+            cold: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.hot.is_empty() && self.cold.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.cold.len()
+            + self
+                .hot
+                .iter()
+                .map(|de| de.pending_subdirs.len())
+                .sum::<usize>()
+    }
+
+    /// Extract up to `count` items as full paths. Drains `cold` first, then constructs paths from `hot` entries. `hot`
+    /// entries that become empty are dropped, closing their fd.
+    fn split_work(&mut self, count: usize) -> Vec<CString> {
+        let mut out = Vec::with_capacity(count.min(self.len()));
+        while out.len() < count {
+            if let Some(cold) = self.cold.pop() {
+                out.push(cold);
+                continue;
+            }
+            match self.hot.last_mut() {
+                None => break,
+                Some(de) => {
+                    let name = de.pending_subdirs.pop().unwrap();
+                    out.push(combine_paths(&de.dir_path, &name));
+                    if de.pending_subdirs.is_empty() {
+                        self.hot.pop();
+                    }
+                }
+            }
+        }
+        out
+    }
+}
 
 pub struct Walker<F1, F2> {
-    // TODO: Consider if there is a better data structure for stashing directories in the queue.
-    queue: Arc<Mutex<Vec<CString>>>,
-    // TODO: There are performance implications using optional function pointers. Experiment with using generic function
-    // parameterization a la `F: Fn(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>` and see if there's a performance bump
-    // from the monomorphization of the callbacks.
-    on_file_entry: F1,
-    on_directory_entry: F2,
+    queue: Rc<Mutex<Queue>>,
+    on_file: F1,
+    on_dir: F2,
 }
 
 impl<F1, F2> Walker<F1, F2>
@@ -42,214 +117,206 @@ where
     F1: FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
     F2: FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
 {
-    pub fn new(on_file_entry: F1, on_directory_entry: F2) -> Self {
+    pub fn new(on_file: F1, on_dir: F2) -> Self {
         Self {
-            queue: Arc::new(Mutex::new(Vec::new())),
-            on_file_entry,
-            on_directory_entry,
+            queue: Rc::new(Mutex::new(Queue::new())),
+            on_file,
+            on_dir,
         }
     }
 
-    // TODO: This probably isn't the most sane way to expose the queue. Used for being able to extract portions of the
-    // queue for work-sharing.
-    /// Get a reference counted mutex exposing the internal directory queue.
+    /// Return a cloneable handle to the internal queue for concurrent work-sharing.
+    pub fn work_queue(&self) -> WorkQueue {
+        WorkQueue(self.queue.clone())
+    }
+
+    /// Walk the file tree rooted at `root` to completion. Non-fatal filesystem errors (permission denied, races, etc.)
+    /// are logged and skipped; callback errors propagate.
+    pub async fn walk(&mut self, root: &Path) -> Result<(), WalkerError> {
+        self.work_queue().extend_cold([root]).await;
+        self.drain().await
+    }
+
+    /// Process all queued directories until the queue is empty.
     ///
-    /// Paths in this queue do not have any fds associated with them.
-    pub fn get_queue(&self) -> Arc<Mutex<Vec<CString>>> {
-        self.queue.clone()
-    }
-
-    /// Get the length of the internal directory queue.
+    /// Used by `circle.rs` in a loop: external work arriving via MPI is injected through `WorkQueue::extend_cold`, then
+    /// this method is called again to process it.
     ///
-    /// Note that this requires locking the queue.
-    pub fn queue_len(&self) -> usize {
-        self.queue.lock_blocking().len()
-    }
-
-    pub async fn walk(&mut self, root: &Path) -> nix::Result<()> {
-        self.queue
-            .lock()
-            .await
-            .push(CString::new(root.as_os_str().as_bytes()).expect("Path contained null byte!"));
-        self.work_directory_queue().await
-    }
-
-    /// Extend the internal directory queue with the provided iterator of `Path`s.
-    pub async fn extend_queue<I: IntoIterator<Item = impl AsRef<Path>>>(
-        &self,
-        paths: I,
-    ) -> nix::Result<()> {
-        let strings = paths.into_iter().map(|path| {
-            CString::new(path.as_ref().as_os_str().as_bytes()).expect("Path contained null byte!")
-        });
-        self.queue.lock().await.extend(strings);
-        Ok(())
-    }
-
-    /// Work on the current directory queue until it's empty, processing all available directories,
-    /// calling `self.on_directory_entry` and `self.on_file_entry` as appropriate.
-    ///
-    /// NOTE: It's important that we take care to prevent us from dropping the `work_directory_queue` future when
-    /// it hasn't completed. If we yield while still holding a file descriptor+filename for faster processing we
-    /// will end up dropping that directory here. The solution is to keep the same walker for all work requests
-    /// until we completely drain the queue and return from the walker task.
-    pub async fn work_directory_queue(&mut self) -> nix::Result<()> {
+    /// All open `Dir` file descriptors live in the queue on the heap, not on the async stack. Cancelling this future is
+    /// safe; fds are dropped with the queue.
+    pub async fn drain(&mut self) -> Result<(), WalkerError> {
         loop {
-            // Pop a directory from the queue, or break if there's no work to do.
-            let Some(dir_path) = self.queue.lock().await.pop() else {
+            let maybe_work = {
+                let mut q = self.queue.lock().await;
+
+                if let Some(de) = q.hot.last_mut() {
+                    // Hot path: cached fd available - use openat to avoid full-path traversal.
+                    let name = de.pending_subdirs.pop().unwrap();
+                    let child_path = combine_paths(&de.dir_path, &name);
+                    let raw_fd = de.fd.as_raw_fd();
+                    // SAFETY: `de` is held in `q.hot` behind the `MutexGuard` and is not
+                    // dropped until after `openat` returns. The fd is valid for the duration
+                    // of this single synchronous syscall.
+                    let result = Dir::openat(
+                        unsafe { BorrowedFd::borrow_raw(raw_fd) },
+                        name.as_c_str(),
+                        OFlag::O_DIRECTORY | OFlag::O_RDONLY,
+                        Mode::empty(),
+                    );
+                    if de.pending_subdirs.is_empty() {
+                        q.hot.pop(); // fd closed here if this was the last pending entry
+                    }
+                    Some((result, child_path))
+                } else if let Some(cold_path) = q.cold.pop() {
+                    // Cold path: no cached fd - open by full path.
+                    let result = Dir::open(
+                        cold_path.as_c_str(),
+                        OFlag::O_DIRECTORY | OFlag::O_RDONLY,
+                        Mode::empty(),
+                    );
+                    Some((result, cold_path))
+                } else {
+                    None
+                }
+            };
+
+            let Some((open_result, dir_path)) = maybe_work else {
                 break;
             };
-            match self.walk_directory_path(&dir_path) {
-                Ok(None) => continue,
-                Err(e) => error!("Error walking directory {:?}: {:?}", dir_path, e),
-                Ok(Some((dir_iterator, entry, new_dir_path))) => {
-                    // We have some subdirectory we can work on, so we repeatedly process it until we run out of
-                    // subdirectories.
 
-                    // We stash the dir iterator behind a `dyn AsRawFd` to keep it around, even when we use a borrowed
-                    // file descriptor to prevent use-after-free issues.
-                    let mut dir_iterator: Box<dyn AsRawFd> = Box::new(dir_iterator);
-                    let mut current_entry = entry;
-                    let mut current_dir_path = new_dir_path;
-                    loop {
-                        // SAFETY: We can never use `dir_fd` without after we drop `dir_iterator`
-                        let dir_fd = unsafe { BorrowedFd::borrow_raw(dir_iterator.as_raw_fd()) };
-                        match self.walk_directory_fd(dir_fd, &current_entry, &current_dir_path) {
-                            Ok(None) => break,
-                            Err(e) => {
-                                error!("Error walking directory {:?}: {:?}", current_dir_path, e);
-                                break;
-                            }
-                            Ok(Some((new_dir_iterator, entry, new_dir_path))) => {
-                                dir_iterator = Box::new(new_dir_iterator);
-                                current_entry = entry;
-                                current_dir_path = new_dir_path;
-                            }
-                        }
-                        // Allow other tasks to make progress
-                        // TODO: There are multiple ways that we could yield and it's unclear which way would be better.
-                        // 1. We can yield after each directory is processed
-                        // 2. We can yield after processing all of the nested directories we have a fd for, this would
-                        //    essentially be yielding after a depth-first traversal of the stack
-                        // 3. We can yield after some number of directories
-                        // 4. We can choose to never yield. This would probably break the multi-processing that we're
-                        //    looking to achieve, but is technically possible.
-                        // WARN: It MAY be a logic bug if we yield while still having a held openfd+directory! We have
-                        // to ensure that the future is never canceled while we still have an open fd+directory to work
-                        // on
-                        yield_now().await;
-                    }
-                }
+            match open_result {
+                Err(e) => warn!("Failed to open {:?}: {e}", dir_path),
+                Ok(dir) => self.process_open_dir(dir, dir_path).await?,
             }
+
+            // All fds live in the queue on the heap, so yielding here is always safe.
             yield_now().await;
         }
         Ok(())
     }
 
-    fn walk_directory_path<'a>(
-        &mut self,
-        dir_path: &CStr,
-    ) -> nix::Result<Option<(impl AsRawFd + 'a, CString, CString)>> {
-        let dir = nix::dir::Dir::open(
-            dir_path,
-            OFlag::O_DIRECTORY | OFlag::O_RDONLY,
-            Mode::empty(),
-        )?;
-        self.on_directory(dir, dir_path)
-    }
+    async fn process_open_dir(&mut self, dir: Dir, dir_path: CString) -> Result<(), WalkerError> {
+        let mut iter = dir.into_iter();
+        let raw_fd = iter.as_raw_fd();
+        // https://github.com/nix-rust/nix/issues/2669
+        // SAFETY: `iter` owns the underlying fd and is not dropped until after the loop. `borrowed_fd` is only used
+        // within this function before `iter` is moved.
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
 
-    fn walk_directory_fd<'a>(
-        &mut self,
-        parent_fd: impl AsFd,
-        dir_name: &CStr,
-        dir_path: &CStr,
-    ) -> nix::Result<Option<(impl AsRawFd + 'a, CString, CString)>> {
-        let dir = nix::dir::Dir::openat(
-            parent_fd,
-            dir_name,
-            OFlag::O_DIRECTORY | OFlag::O_RDONLY,
-            Mode::empty(),
-        )?;
-        self.on_directory(dir, dir_path)
-    }
+        let mut pending_subdirs: Vec<CString> = Vec::new();
 
-    /// Walk the provided `Dir`, iterating over its entries and calling the appropriate callbacks on each. Entry. If
-    /// there are any subdirectories, we stash all but one of them in the queue for later processing, and return the
-    /// final directory, the parent file descriptor, and the path of the directory for later processing.
-    fn on_directory<'a>(
-        &mut self,
-        dir: Dir,
-        dir_path: &CStr,
-    ) -> nix::Result<Option<(impl AsRawFd + 'a, CString, CString)>> {
-        let mut dir_iterator = dir.into_iter();
-        let mut dir_names = Vec::new();
+        loop {
+            let entry = match iter.next() {
+                None => break,
+                Some(Err(e)) => {
+                    warn!("Error reading entry in {:?}: {e}", dir_path);
+                    continue;
+                }
+                Some(Ok(e)) => e,
+            };
 
-        while let Some(entry) = dir_iterator.next() {
-            // TODO: Handle errors we can recover from here, and avoid aborting everything.
-            // Also determine what errors we can recover from.
-            let entry = entry?;
-            // TODO: Is there a more direct way of comparing these?
-            if entry.file_name().to_bytes() == b"." || entry.file_name().to_bytes() == b".." {
+            if is_dot_or_dotdot(entry.file_name()) {
                 continue;
             }
-            // https://github.com/nix-rust/nix/issues/2669
-            // TODO: SAFETY: We borrow the file descriptor, but have to ensure that the dir_iterator is not dropped
-            // while the borrowed file descriptor is still in use. I'm not 100% sure on the soundness of this without
-            // consulting others.
-            let fd = unsafe { BorrowedFd::borrow_raw(dir_iterator.as_raw_fd()) };
-            match entry.file_type() {
-                None => todo!(
-                    "Need to stat the entry to determine the file type, since it wasn't provided by the filesystem"
-                ),
-                Some(nix::dir::Type::Directory) => {
-                    (self.on_directory_entry)(&fd, dir_path, &entry)?;
-                    dir_names.push(entry.file_name().to_owned());
+
+            let is_dir = match entry.file_type() {
+                Some(Type::Directory) => true,
+                Some(_) => false,
+                None => {
+                    // TODO: This is a degenerate case that means we're going to be doing more syscalls than we normally
+                    // would. When we traverse into a filesystem like this, we should warn about it.
+                    // Filesystem didn't provide a file type in the dirent; stat to determine.
+                    // Everything that isn't confirmed to be a directory is treated as a file.
+                    match stat::fstatat(
+                        borrowed_fd,
+                        entry.file_name(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    ) {
+                        Ok(s) => {
+                            (SFlag::S_IFMT & SFlag::from_bits_truncate(s.st_mode)) == SFlag::S_IFDIR
+                        }
+                        Err(e) => {
+                            warn!("fstatat failed for {:?}: {e}", entry.file_name());
+                            false
+                        }
+                    }
                 }
-                _ => {
-                    (self.on_file_entry)(&fd, dir_path, &entry)?;
-                }
+            };
+
+            if is_dir {
+                (self.on_dir)(&borrowed_fd, &dir_path, &entry).map_err(WalkerError::Nix)?;
+                pending_subdirs.push(entry.file_name().to_owned());
+            } else {
+                (self.on_file)(&borrowed_fd, &dir_path, &entry).map_err(WalkerError::Nix)?;
             }
         }
-        match dir_names.len() {
-            // There's no directory to seed the next directory walk with, so there's nothing to do.
-            0 => Ok(None),
-            // There's exactly one directory, so we can yield it without stashing anything in the queue.
-            1 => {
-                let entry = dir_names.pop().unwrap();
-                let new_dir_path = combine_paths(dir_path, &entry);
-                Ok(Some((dir_iterator, entry, new_dir_path)))
-            }
-            // There's more than one directory, so we stash all but one in the queue for later processing
-            _ => {
-                for entry in dir_names.drain(..dir_names.len() - 1) {
-                    let new_dir_path = combine_paths(dir_path, &entry);
-                    self.queue.lock_blocking().push(new_dir_path);
-                }
-                let entry = dir_names.pop().unwrap();
-                let new_dir_path = combine_paths(dir_path, &entry);
-                Ok(Some((dir_iterator, entry, new_dir_path)))
-            }
+
+        if !pending_subdirs.is_empty() {
+            self.queue.lock().await.hot.push(DirectoryEntries {
+                fd: Box::new(iter),
+                dir_path,
+                pending_subdirs,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// A cheaply cloneable handle to the walker's internal queue for MPI work-sharing.
+#[derive(Clone)]
+pub struct WorkQueue(Rc<Mutex<Queue>>);
+
+impl WorkQueue {
+    pub async fn is_empty(&self) -> bool {
+        self.0.lock().await.is_empty()
+    }
+
+    pub async fn len(&self) -> usize {
+        self.0.lock().await.len()
+    }
+
+    /// Atomically extract up to `count` work items as full paths. Returns an empty vec if
+    /// the queue is empty or count is zero.
+    pub async fn try_split_work(&self, count: usize) -> Vec<CString> {
+        self.0.lock().await.split_work(count)
+    }
+
+    /// Inject full paths (e.g. received from another MPI rank) into the cold queue.
+    pub async fn extend_cold(&self, paths: impl IntoIterator<Item = impl AsRef<Path>>) {
+        let mut q = self.0.lock().await;
+        for p in paths {
+            let bytes = p.as_ref().as_os_str().as_bytes().to_vec();
+            // SAFETY: Filesystem paths sourced from the kernel via readdir (or transferred
+            // as serialized byte strings from other ranks) cannot contain null bytes.
+            q.cold.push(unsafe { CString::from_vec_unchecked(bytes) });
         }
     }
 }
 
-pub fn combine_paths(base: &CStr, entry: &CStr) -> CString {
-    // TODO: The goal here is to avoid interpreting the path as UTF-8, is there a better way to do this?
-    // TODO: Considering where we're getting this from, it should always be a valid path, even if it's not
-    // valid UTF-8, so we should be able to use the unchecked variants of this function.
-    let mut combined = Vec::with_capacity(base.len() + entry.len() + 1);
-    combined.extend_from_slice(base.to_bytes());
-    combined.push(b'/');
-    combined.extend_from_slice(entry.to_bytes());
-    combined.push(0);
-    CString::from_vec_with_nul(combined).expect("Combined path contained null byte!")
-}
-
-// The type is complex, but you can't really simplify the impl Trait without trait aliases, which are still unstable.
+/// Create a walker with no-op callbacks.
 #[allow(clippy::type_complexity)]
 pub fn nothing_walker() -> Walker<
     impl FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
     impl FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
 > {
     Walker::new(|_, _, _| Ok(()), |_, _, _| Ok(()))
+}
+
+/// Combine a base directory path and an entry name into a child path without UTF-8 interpretation.
+pub fn combine_paths(base: &CStr, entry: &CStr) -> CString {
+    let base_bytes = base.to_bytes();
+    let entry_bytes = entry.to_bytes();
+    let mut v = Vec::with_capacity(base_bytes.len() + 1 + entry_bytes.len());
+    v.extend_from_slice(base_bytes);
+    v.push(b'/');
+    v.extend_from_slice(entry_bytes);
+    // SAFETY: `base` and `entry` are `CStr`s (no interior null bytes), and filesystem
+    // paths from readdir cannot contain null bytes. b'/' is not null.
+    unsafe { CString::from_vec_unchecked(v) }
+}
+
+fn is_dot_or_dotdot(name: &CStr) -> bool {
+    let b = name.to_bytes();
+    b == b"." || b == b".."
 }

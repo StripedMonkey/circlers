@@ -11,7 +11,7 @@ use std::io::{self, BufWriter};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::str::FromStr;
-use tracing::{Level, debug, span, trace};
+use tracing::{Level, debug, span};
 use tracing_subscriber::EnvFilter;
 
 use circlers::Circle;

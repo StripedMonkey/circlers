@@ -28,7 +28,7 @@ fn main() -> io::Result<()> {
                 Ok(())
             },
         );
-        walker.walk(root).await?;
+        walker.walk(root).await.map_err(|e| io::Error::other(e.to_string()))?;
         Ok(())
     }));
 

@@ -2,7 +2,6 @@ use std::{
     ffi::{CStr, CString},
     os::{fd::AsFd, unix::ffi::OsStringExt},
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use ferrompi::Communicator;
@@ -72,9 +71,10 @@ impl Circle {
         F2: FnMut(&dyn AsFd, &CStr, &Entry) -> nix::Result<()>,
     {
         let mut walker = walker::Walker::new(on_file_entry, on_dir_entry);
+        let work_queue = walker.work_queue();
 
         if let Some(path) = path {
-            walker.extend_queue([path]).await.unwrap();
+            work_queue.extend_cold([path]).await;
         }
 
         // At this point, we have two tasks we need to run concurrently:
@@ -82,11 +82,11 @@ impl Circle {
         // - Work request handling
         // We don't need to handle termination detection since we know termination can't occur until we're locally idle.
         // any termination progress can be made after we're idle.
-        let handle_work_requests = self.work_loop(walker.get_queue()).fuse();
+        let handle_work_requests = self.work_loop(work_queue.clone()).fuse();
         pin!(handle_work_requests);
         loop {
             {
-                let walker_worker = walker.work_directory_queue().fuse();
+                let walker_worker = walker.drain().fuse();
                 pin!(walker_worker);
                 select! {
                     res = walker_worker => {
@@ -102,7 +102,7 @@ impl Circle {
                 }
             }
             debug_assert!(
-                walker.queue_len() == 0,
+                work_queue.is_empty().await,
                 "
                 After completing a walk task, the queue should be empty since we should have stashed all directories for
                 later processing or distribution.
@@ -132,7 +132,7 @@ impl Circle {
                 work = self.request_work().fuse() => match work {
                     Ok(work) => {
                         debug!("Received {} work items from another rank", work.len());
-                        walker.extend_queue(work).await.unwrap();
+                        work_queue.extend_cold(work).await;
                         continue;
                     },
                     Err(e) => {
@@ -203,36 +203,29 @@ impl Circle {
     /// Handle incoming work requests and acks from ranks we've given work to.
     async fn work_loop(
         &self,
-        queue: Arc<smol::lock::Mutex<Vec<CString>>>,
+        work_queue: walker::WorkQueue,
     ) -> Result<(), CircleError> {
-        // Continuously handle four types of incoming messages:
-        // 1. WorkRequest: respond with work from our queue or reject
-        // 2. WorkAck: receive acknowledgment that our work was received
-        // 3. Token: receive the token for distributed termination detection
-        // 4. TerminationConfirmed: receive confirmation that termination has been detected and we can exit
+        let mut rng = rand::rng();
         loop {
             select! {
                 work_request_status = async_mpi::receive_tagged(&self.comm, SOURCE_ANY, Tag::WorkRequest as i32).fuse() => {
                     let (source, _work_request_status): (i32, Vec<u8>) = work_request_status?;
-                    let response = {
-                        let mut queue_guard = queue.lock().await;
-                        if queue_guard.is_empty() {
-                            trace!("Rejecting WorkRequest from rank {} since we have no work to share", source);
-                            WorkResponse::Reject
-                        } else {
-                            // If we're sending work, mark ourselves as black and increment pending receipts
-                            self.termination_state.on_message_sent().await;
-                            let mut rng = rand::rng();
-                            // Keep at least one item in the queue for ourselves, and share the rest.
-                            let share_count = rng.random_range(1..=queue_guard.len());
-                            let mut shared_work = Vec::with_capacity(share_count);
-                            for _ in 0..share_count {
-                                let idx = rng.random_range(0..queue_guard.len());
-                                shared_work.push(queue_guard.swap_remove(idx).into_bytes());
-                            }
-                            trace!("Sharing {} work items with rank {}", shared_work.len(), source);
-                            WorkResponse::Work(shared_work)
-                        }
+                    let queue_len = work_queue.len().await;
+                    let response = if queue_len == 0 {
+                        trace!("Rejecting WorkRequest from rank {} since we have no work to share", source);
+                        WorkResponse::Reject
+                    } else {
+                        // If we're sending work, mark ourselves as black and increment pending receipts
+                        self.termination_state.on_message_sent().await;
+                        let share_count = rng.random_range(1..=queue_len);
+                        let shared_work = work_queue
+                            .try_split_work(share_count)
+                            .await
+                            .into_iter()
+                            .map(CString::into_bytes)
+                            .collect::<Vec<_>>();
+                        trace!("Sharing {} work items with rank {}", shared_work.len(), source);
+                        WorkResponse::Work(shared_work)
                     };
                     let response_buf = postcard::to_allocvec(&response)?;
                     async_mpi::isend(&self.comm, &response_buf, source, Tag::WorkResponse as i32).await?;
